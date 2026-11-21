@@ -1,8 +1,11 @@
 # VPN Launcher
 
-A small Windows tray application that connects OpenVPN profiles with one click, including
-servers that ask for a one-time code. Several connections can be up at the same time; each
-one is connected and disconnected on its own.
+A small tray application for Windows and macOS that connects OpenVPN profiles with one click,
+including servers that ask for a one-time code. Several connections can be up at the same
+time; each one is connected and disconnected on its own.
+
+The Windows build is the tested one. The macOS build is new and has only been through the
+automated build checks: see [macOS](#macos) below.
 
 ## Features
 
@@ -30,7 +33,42 @@ afterwards never does.
 
 The installer is not code-signed, so Windows SmartScreen warns about an unknown publisher.
 
-## Where things are stored
+## macOS
+
+Download `VpnLauncher-<version>-arm64.dmg` (Apple Silicon), open it and drag **VPN Launcher** to
+Applications.
+
+The app is not signed or notarized, so macOS refuses to open it at first. Either right-click the
+app, choose **Open** and confirm, or remove the quarantine flag:
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/VPN Launcher.app"
+```
+
+Prerequisites, installed with [Homebrew](https://brew.sh):
+
+```bash
+brew install openvpn           # the launcher runs this itself on the first connect if it is missing
+brew install 1password-cli     # only for profiles that use 1Password
+```
+
+How it differs from Windows:
+
+- **Administrator prompt on every connect.** OpenVPN needs root on macOS and there is no service to
+  delegate to, so macOS asks for an administrator password each time. Disconnecting does not ask.
+- **Stricter profiles.** Because OpenVPN runs as root, a profile that uses directives which run
+  programs or write files (`up`, `down`, `plugin`, `log`, ...) is refused, not just warned about.
+- **Menu bar item** instead of a tray icon; closing the window keeps the app in the menu bar, a click
+  on the Dock icon brings the window back.
+- **Keychain** instead of DPAPI for a saved one-time code key.
+- Data lives in `~/Library/Application Support/VpnLauncher/`, runtime files and logs in
+  `$TMPDIR/vpn_connect_op/`.
+
+Known gaps: the profile is checked just before OpenVPN starts, not by root itself; starting the app
+twice does not bring the first window forward; DNS servers pushed by the VPN server are not applied
+(OpenVPN leaves that to scripts, which are blocked).
+
+## Where things are stored (Windows)
 
 | What | Where |
 |---|---|
@@ -71,9 +109,12 @@ Layout:
 
 | Path | Purpose |
 |---|---|
-| `src/vpn_launcher.py` | The window, the tray icon, profile editor, traffic graph |
-| `src/vpn_connect_op.ps1` | Connects, reports and stops one named OpenVPN connection |
-| `build.ps1` | Builds the PyInstaller folder and the installer |
+| `src/vpn_launcher.py` | The window, profile editor, traffic graph; shared by both systems |
+| `src/vpn_connect_op.ps1` | Windows: connects, reports and stops one named OpenVPN connection |
+| `src/vpn_mac.py` | macOS: the same job, plus Keychain, autostart and the menu bar item |
+| `build.ps1` | Windows: builds the PyInstaller folder and the installer |
+| `build_mac.sh` | macOS: builds the app bundle and the disk image |
+| `tests/smoke_profiles.py` | Sample profiles for the smoke run of the build pipeline |
 | `installer.iss` | Inno Setup script |
 | `assets/` | Application icon |
 

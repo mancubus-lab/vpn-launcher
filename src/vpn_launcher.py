@@ -32,39 +32,53 @@ import threading
 import time
 import tkinter as tk
 import uuid
-import winreg
 from pathlib import Path
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 import sv_ttk
-import win32api
-import win32con
-import win32crypt
-import win32event
-import win32gui
 from PIL import Image, ImageDraw, ImageTk
+
+# One program for Windows and macOS. The window is shared; what talks to the system is chosen here:
+# Win32 calls and the PowerShell connect script on Windows, the vpn_mac module on macOS.
+WINDOWS = sys.platform == "win32"
+if WINDOWS:
+    import winreg
+
+    import win32api
+    import win32con
+    import win32crypt
+    import win32event
+    import win32gui
+else:
+    import vpn_mac
 
 FROZEN = getattr(sys, "frozen", False)  # True in the installed build made by PyInstaller
 # Bundled files sit next to this file, or in PyInstaller's resource folder in the installed build.
 RESOURCES = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 # Profiles, settings and imported .ovpn files live in the user profile, never next to the code:
 # Program Files is read-only for the user, and a source checkout must not collect personal data.
-DATA = Path(os.environ["APPDATA"]) / "VpnLauncher"
+DATA = Path(os.environ["APPDATA"]) / "VpnLauncher" if WINDOWS else vpn_mac.DATA
 # How to start this program again (autostart entry, restart after a profile or theme change).
-SELF = [sys.executable] if FROZEN else [str(Path(sys.executable).with_name("pythonw.exe")), str(Path(__file__).resolve())]
+if FROZEN:
+    SELF = [sys.executable]
+elif WINDOWS:
+    SELF = [str(Path(sys.executable).with_name("pythonw.exe")), str(Path(__file__).resolve())]
+else:
+    SELF = [sys.executable, str(Path(__file__).resolve())]
 SCRIPT = str(RESOURCES / "vpn_connect_op.ps1")
 PROFILES = DATA / "vpn_launcher_profiles.json"
 PROFILE_DIR = DATA / "vpn_launcher_profiles"  # imported .ovpn files
 GRAPH_POINTS = 60 # traffic samples kept for the graph: two minutes at one sample per 2 s
 SETTINGS = DATA / "vpn_launcher_settings.json"
-WORK = Path(os.environ["TEMP"]) / "vpn_connect_op"  # the script keeps one subfolder per connection here
+# One subfolder per connection with its log and runtime files.
+WORK = Path(os.environ["TEMP"]) / "vpn_connect_op" if WINDOWS else vpn_mac.WORK
 JOURNAL = WORK / "launcher.log"  # copy of the window's journal for later troubleshooting
 JOURNAL_BYTES = 1_000_000  # per file; one older file (launcher.log.1) is kept, so at most twice this on disk
 ICONS = DATA / "vpn_launcher_icons"  # generated on first use
 PWSH = shutil.which("pwsh") or "powershell"
-NO_WINDOW = subprocess.CREATE_NO_WINDOW
+NO_WINDOW = subprocess.CREATE_NO_WINDOW if WINDOWS else 0
 REFRESH_MS = 2000
-TRAY_MSG = win32con.WM_USER + 20
+TRAY_MSG = 0x0400 + 20  # WM_USER + 20: our private message from the tray icon
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 APP_ID = "VpnLauncher"
 COLORS = {"off": "#7a7a7a", "connecting": "#e08a00", "on": "#2e9e44"}
@@ -79,9 +93,9 @@ UPLOAD = "#3b7dd8"
 NIIF_USER_LARGE = 0x4 | 0x20  # NIIF_USER | NIIF_LARGE_ICON: the notification shows our icon, not the blue "i"
 # Setting key, checkbox label, default value.
 CHECKBOXES = [
-    ("autostart", "Start with Windows", False),
-    ("start_minimized", "Start minimized to tray", False),
-    ("close_to_tray", "Close button minimizes to tray", True),
+    ("autostart", "Start with Windows" if WINDOWS else "Start at login", False),
+    ("start_minimized", "Start minimized to tray" if WINDOWS else "Start hidden in the menu bar", False),
+    ("close_to_tray", "Close button minimizes to tray" if WINDOWS else "Close button hides to the menu bar", True),
     ("notify", "Show connection notifications", True),
     ("show_log", "Show log", False),
 ]
@@ -123,6 +137,8 @@ def register_app_id():
 
 def run_script(*args, stdin_text=""):
     """Runs the connect script; returns (exit code, output). Never raises: the caller's busy state depends on it."""
+    if not WINDOWS:
+        return vpn_mac.run(args, stdin_text, risky_directives)
     try:
         return _run_script(*args, stdin_text=stdin_text)
     except OSError as err:
@@ -226,14 +242,19 @@ assert totp("GEZD GNBV GY3T QOJQ gezdgnbvgy3tqojq", 59) == "287082"
 
 def protect(text):
     """Encrypts a secret with Windows DPAPI: only this Windows user on this machine can read it back."""
+    if not WINDOWS:
+        return vpn_mac.protect(text)  # the login Keychain; the returned handle is what gets saved
     return base64.b64encode(win32crypt.CryptProtectData(text.encode(), "VPN Launcher", None, None, None, 0)).decode()
 
 
 def unprotect(blob):
+    if not WINDOWS:
+        return vpn_mac.unprotect(blob)
     return win32crypt.CryptUnprotectData(base64.b64decode(blob), None, None, None, 0)[1].decode()
 
 
-assert unprotect(protect("round trip")) == "round trip"
+if WINDOWS:  # not on macOS: a check at every start would leave an entry in the user's Keychain
+    assert unprotect(protect("round trip")) == "round trip"
 
 
 def check_profile(profile):
@@ -330,12 +351,15 @@ def watch_traffic(name, links, samples):
 
 
 def vpn_status(names):
-    """Returns {name: (state, text, log_text)}; a connection is alive while the PID the script saved is an openvpn.exe."""
-    tasks = subprocess.run(
-        ["tasklist", "/FI", "IMAGENAME eq openvpn.exe", "/NH", "/FO", "CSV"],
-        capture_output=True, text=True, creationflags=NO_WINDOW,
-    ).stdout
-    pids = set(re.findall(r'^"openvpn\.exe","(\d+)"', tasks, re.MULTILINE | re.IGNORECASE))
+    """Returns {name: (state, text, log_text)}; a connection is alive while the PID saved for it is an openvpn process."""
+    if WINDOWS:
+        tasks = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq openvpn.exe", "/NH", "/FO", "CSV"],
+            capture_output=True, text=True, creationflags=NO_WINDOW,
+        ).stdout
+        pids = set(re.findall(r'^"openvpn\.exe","(\d+)"', tasks, re.MULTILINE | re.IGNORECASE))
+    else:
+        pids = vpn_mac.openvpn_pids()
     result = {}
     for name in names:
         pid_file, log_file = WORK / name / "pid.txt", WORK / name / "openvpn.log"
@@ -360,9 +384,11 @@ def load_settings():
 
 
 def resolve_theme(choice):
-    """"light" or "dark"; "auto" (and anything unknown) follows the Windows app mode."""
+    """"light" or "dark"; "auto" (and anything unknown) follows the system's app mode."""
     if choice in ("light", "dark"):
         return choice
+    if not WINDOWS:
+        return vpn_mac.system_theme()
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                             r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as key:
@@ -379,8 +405,11 @@ def on_screen(geometry):
     found = re.fullmatch(r"\d+x\d+\+(-?\d+)\+(-?\d+)", geometry or "")
     if not found:
         return False
-    left, top, width, height = (ctypes.windll.user32.GetSystemMetrics(index) for index in (76, 77, 78, 79))
     x, y = int(found.group(1)), int(found.group(2))
+    if not WINDOWS:
+        # shortcut: a generous range instead of the real monitor layout, macOS moves a stray window back itself.
+        return -5000 <= x < 10000 and 0 <= y < 6000
+    left, top, width, height = (ctypes.windll.user32.GetSystemMetrics(index) for index in (76, 77, 78, 79))
     return left <= x < left + width - 100 and top <= y < top + height - 100
 
 
@@ -388,6 +417,9 @@ assert not on_screen("") and not on_screen("800x600+999999+0") and not on_screen
 
 
 def set_autostart(enabled):
+    if not WINDOWS:
+        vpn_mac.set_autostart(enabled, SELF)
+        return
     command = subprocess.list2cmdline(SELF)
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
         if enabled:
@@ -441,10 +473,23 @@ def show_modal(root, box, focus):
 
 def match_title_bar(window):
     """Makes the Windows title bar dark when the dark theme is on; it does not follow the ttk theme."""
+    if not WINDOWS:
+        return  # macOS draws the title bar in the system appearance
     window.update_idletasks()
     dark = ctypes.c_int(sv_ttk.get_theme() == "dark")
     ctypes.windll.dwmapi.DwmSetWindowAttribute(  # 20 = DWMWA_USE_IMMERSIVE_DARK_MODE
         ctypes.windll.user32.GetParent(window.winfo_id()), 20, ctypes.byref(dark), ctypes.sizeof(dark))
+
+
+def set_window_icon(window, state):
+    """Title bar and taskbar icon. macOS windows have none: the Dock icon comes from the app bundle."""
+    if WINDOWS:
+        window.iconbitmap(icon_path(state))
+
+
+def display_scale(root):
+    """Screen pixels per design pixel. Tk works in real pixels on Windows only; macOS scales windows itself."""
+    return root.winfo_fpixels("1i") / 96 if WINDOWS else 1.0
 
 
 def new_dialog(root):
@@ -454,7 +499,7 @@ def new_dialog(root):
     box.configure(bg=ttk.Style().lookup("TFrame", "background"))  # a Toplevel does not follow the ttk theme
     match_title_bar(box)
     box.resizable(False, False)
-    box.iconbitmap(icon_path("on"))
+    set_window_icon(box, "on")
     return box
 
 
@@ -636,6 +681,8 @@ def first_instance():
     Two instances would fight over the single OpenVPN management link and overwrite each other's files.
     The mutex name is also the AppMutex of the installer, which uses it to see that the program is open.
     """
+    if not WINDOWS:
+        return vpn_mac.first_instance(wait="--show" in sys.argv)
     global _instance_mutex  # kept for the life of the process: Windows frees it when the process ends
     _instance_mutex = win32event.CreateMutex(None, True, "VpnLauncherSingleInstance")
     if win32api.GetLastError() != 183:  # ERROR_ALREADY_EXISTS
@@ -652,15 +699,17 @@ def first_instance():
 
 
 def main():
-    # Without this Windows bitmap-scales the window on a scaled display and it looks blurry.
-    ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    if WINDOWS:
+        # Without this Windows bitmap-scales the window on a scaled display and it looks blurry.
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
     if not first_instance():
         return
     DATA.mkdir(parents=True, exist_ok=True)
-    register_app_id()
+    if WINDOWS:
+        register_app_id()
     root = tk.Tk()
     root.title("VPN Launcher")
-    root.iconbitmap(icon_path("off"))
+    set_window_icon(root, "off")
     settings = load_settings()
     theme = resolve_theme(settings["theme"])
     ui = PALETTES[theme]
@@ -671,7 +720,7 @@ def main():
     for font_name in tkfont.names(root):
         if font_name.startswith("SunValley"):
             theme_font = tkfont.nametofont(font_name)
-            theme_font.configure(size=round(theme_font.cget("size") * root.winfo_fpixels("1i") / 96))
+            theme_font.configure(size=round(theme_font.cget("size") * display_scale(root)))
 
     try:
         profiles = load_profiles()
@@ -690,7 +739,7 @@ def main():
     frame = ttk.Frame(root, padding=16)
     frame.pack(fill="both", expand=True)
     # The same padlock as in the tray and the title bar, sized for the display scale.
-    side = round(36 * root.winfo_fpixels("1i") / 96)
+    side = round(36 * display_scale(root))
     pictures = {name: ImageTk.PhotoImage(Image.open(icon_path(name).with_suffix(".png")).resize((side, side)))
                 for name in COLORS}
 
@@ -751,7 +800,7 @@ def main():
                   ["-ProfilePath", p["profile_path"]], stdin_text=f"{typed[0]}\n{typed[1]}\n")
         elif conn["vpn"] == "off":
             start(p["name"], "Connecting...",
-                  f"{p['name']}: approve the 1Password prompt.",
+                  f"{p['name']}: approve the 1Password prompt." + ("" if WINDOWS else " Then the administrator prompt."),
                   ["-Vault", p["vault"], "-Item", p["item"], "-ProfileFile", p["profile_file"],
                    "-OtpField", p.get("otp_field") or "one-time password", "-OtpMode", p.get("otp_mode") or "Auto"])
         else:
@@ -800,7 +849,7 @@ def main():
             imported.unlink(missing_ok=True)
         restart()
 
-    scale = root.winfo_fpixels("1i") / 96
+    scale = display_scale(root)
     graph_size = round(170 * scale), round(44 * scale)
 
     # One card per connection: padlock indicator, name, status line, traffic graph and its own buttons.
@@ -894,7 +943,7 @@ def main():
         overall = overall_state([conn["vpn"] for conn in conns.values()])
         if overall != app["overall"]:
             app["overall"] = overall
-            root.iconbitmap(icon_path(overall))  # window and taskbar icon follow the state
+            set_window_icon(root, overall)  # window and taskbar icon follow the state
         update_tray()  # after notify: it restores the small tray icon
 
     def check_now():
@@ -975,29 +1024,20 @@ def main():
     if on_screen(settings.get("geometry")):  # not when that monitor is gone
         root.geometry(settings["geometry"])
 
-    # Tray icon: gray, orange or green padlock by state. Tk's event loop also pumps this window.
-    # shortcut: the icon is not re-added after an Explorer restart, handle TaskbarCreated if that matters.
     def show_window():
         root.deiconify()
         root.lift()
         root.focus_force()
 
-    def tray(*call):
-        """Shell_NotifyIcon that tolerates a missing icon: after an Explorer restart every call would raise."""
-        try:
-            win32gui.Shell_NotifyIcon(*call)
-        except win32gui.error:
-            pass
-
     def quit_app():
-        tray(win32gui.NIM_DELETE, (tray_hwnd, 0))
+        remove_tray()
         root.destroy()
 
     def restart():
         # shortcut: a profile change restarts the program instead of rebuilding the cards, running VPNs are not touched.
         if any(conn["busy"] for conn in conns.values()):
             return False  # a connect or disconnect script is running: a restart would leave it without an owner
-        tray(win32gui.NIM_DELETE, (tray_hwnd, 0))
+        remove_tray()
         subprocess.Popen([*SELF, "--show"], creationflags=NO_WINDOW)
         root.destroy()
         return True
@@ -1011,59 +1051,103 @@ def main():
             items.append((f"{verb} {p['name']}", lambda p=p: toggle(p), not conn["busy"] and conn["vpn"] is not None))
         return items + [("Open window", show_window, True), ("Exit", quit_app, True)]
 
-    def tray_menu():
-        items = menu_items()
-        menu = win32gui.CreatePopupMenu()
-        for number, (text, _, enabled) in enumerate(items, 1):
-            flags = win32con.MF_STRING | (0 if enabled else win32con.MF_GRAYED)
-            win32gui.AppendMenu(menu, flags, number, text)
-        win32gui.SetForegroundWindow(tray_hwnd)  # otherwise the menu stays open after a click outside
-        x, y = win32gui.GetCursorPos()
-        chosen = win32gui.TrackPopupMenu(menu, win32con.TPM_RETURNCMD | win32con.TPM_NONOTIFY,
-                                         x, y, 0, tray_hwnd, None)
-        win32gui.DestroyMenu(menu)
-        if chosen:
-            root.after(0, items[chosen - 1][1])
-
-    def on_tray(hwnd, msg, wparam, lparam):
-        if lparam == win32con.WM_LBUTTONUP:
-            show_window()
-        elif lparam == win32con.WM_RBUTTONUP:
-            tray_menu()
-        return 0
-
-    window_class = win32gui.WNDCLASS()
-    window_class.hInstance = win32api.GetModuleHandle(None)
-    window_class.lpszClassName = "VpnLauncherTray"
-    window_class.lpfnWndProc = {TRAY_MSG: on_tray}
-    tray_hwnd = win32gui.CreateWindow(win32gui.RegisterClass(window_class), "", 0, 0, 0, 0, 0, 0, 0,
-                                      window_class.hInstance, None)
-    icons = {name: load_icon(name, win32con.SM_CXSMICON) for name in COLORS}
-    big_icons = {name: load_icon(name, win32con.SM_CXICON) for name in COLORS}
-
-    def tray_data():
+    def tray_tip():
         words = {None: "checking", "off": "off", "connecting": "connecting", "on": "connected"}
-        tip = ", ".join(f"{name}: {words[conn['vpn']]}" for name, conn in conns.items())
-        flags = win32gui.NIF_ICON | win32gui.NIF_MESSAGE | win32gui.NIF_TIP
-        return tray_hwnd, 0, flags, TRAY_MSG, icons[app["overall"] or "off"], f"VPN — {tip}"[:127]
+        return "VPN — " + ", ".join(f"{name}: {words[conn['vpn']]}" for name, conn in conns.items())
 
-    def update_tray():
-        tray(win32gui.NIM_MODIFY, tray_data())
+    # The icon next to the clock: gray, orange or green padlock by state, with a menu of the connections.
+    # Each platform defines update_tray(), notify(title, text, state) and remove_tray().
+    if WINDOWS:
+        # Tk's event loop also pumps the hidden window that receives the icon's messages.
+        # shortcut: the icon is not re-added after an Explorer restart, handle TaskbarCreated if that matters.
+        def tray(*call):
+            """Shell_NotifyIcon that tolerates a missing icon: after an Explorer restart every call would raise."""
+            try:
+                win32gui.Shell_NotifyIcon(*call)
+            except win32gui.error:
+                pass
 
-    def notify(title, text, state):
-        if settings["notify"]:
-            tray(win32gui.NIM_MODIFY, (
-                tray_hwnd, 0, win32gui.NIF_INFO | win32gui.NIF_ICON, TRAY_MSG, big_icons[state], "",
-                text[:255], 10, title, NIIF_USER_LARGE))
+        def tray_menu():
+            items = menu_items()
+            menu = win32gui.CreatePopupMenu()
+            for number, (text, _, enabled) in enumerate(items, 1):
+                flags = win32con.MF_STRING | (0 if enabled else win32con.MF_GRAYED)
+                win32gui.AppendMenu(menu, flags, number, text)
+            win32gui.SetForegroundWindow(tray_hwnd)  # otherwise the menu stays open after a click outside
+            x, y = win32gui.GetCursorPos()
+            chosen = win32gui.TrackPopupMenu(menu, win32con.TPM_RETURNCMD | win32con.TPM_NONOTIFY,
+                                             x, y, 0, tray_hwnd, None)
+            win32gui.DestroyMenu(menu)
+            if chosen:
+                root.after(0, items[chosen - 1][1])
 
-    tray(win32gui.NIM_ADD, tray_data())
+        def on_tray(hwnd, msg, wparam, lparam):
+            if lparam == win32con.WM_LBUTTONUP:
+                show_window()
+            elif lparam == win32con.WM_RBUTTONUP:
+                tray_menu()
+            return 0
+
+        window_class = win32gui.WNDCLASS()
+        window_class.hInstance = win32api.GetModuleHandle(None)
+        window_class.lpszClassName = "VpnLauncherTray"
+        window_class.lpfnWndProc = {TRAY_MSG: on_tray}
+        tray_hwnd = win32gui.CreateWindow(win32gui.RegisterClass(window_class), "", 0, 0, 0, 0, 0, 0, 0,
+                                          window_class.hInstance, None)
+        icons = {name: load_icon(name, win32con.SM_CXSMICON) for name in COLORS}
+        big_icons = {name: load_icon(name, win32con.SM_CXICON) for name in COLORS}
+
+        def tray_data():
+            flags = win32gui.NIF_ICON | win32gui.NIF_MESSAGE | win32gui.NIF_TIP
+            return tray_hwnd, 0, flags, TRAY_MSG, icons[app["overall"] or "off"], tray_tip()[:127]
+
+        def update_tray():
+            tray(win32gui.NIM_MODIFY, tray_data())
+
+        def notify(title, text, state):
+            if settings["notify"]:
+                tray(win32gui.NIM_MODIFY, (
+                    tray_hwnd, 0, win32gui.NIF_INFO | win32gui.NIF_ICON, TRAY_MSG, big_icons[state], "",
+                    text[:255], 10, title, NIIF_USER_LARGE))
+
+        def remove_tray():
+            tray(win32gui.NIM_DELETE, (tray_hwnd, 0))
+
+        tray(win32gui.NIM_ADD, tray_data())
+    else:
+        # Menu bar item; its actions are handed to Tk's loop like the tray menu's on Windows.
+        status_item = vpn_mac.StatusItem(
+            lambda: [(text, lambda action=action: root.after(0, action), enabled)
+                     for text, action, enabled in menu_items()],
+            lambda state: str(icon_path(state).with_suffix(".png")))
+
+        def update_tray():
+            status_item.update(app["overall"] or "off", tray_tip())
+
+        def notify(title, text, state):
+            if settings["notify"]:
+                vpn_mac.notify(title, text)
+
+        remove_tray = status_item.remove
+        root.createcommand("tk::mac::ReopenApplication", show_window)  # a click on the Dock icon
+        root.createcommand("tk::mac::Quit", quit_app)  # Cmd-Q and Quit in the Dock menu
     root.protocol("WM_DELETE_WINDOW", lambda: root.withdraw() if settings["close_to_tray"] else quit_app())
     if settings["start_minimized"] and "--show" not in sys.argv:  # --show: restarted after a profile change
         root.withdraw()
+    if "--smoke" in sys.argv:  # used by the build pipeline: the window must come up and close without an error
+        root.report_callback_exception = lambda *error: (journal.error("Smoke test", exc_info=error), os._exit(1))
+        root.after(5000, quit_app)
 
     refresh()
     root.mainloop()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        # The windowed build has no console: leave the reason for a failed start where it can be found.
+        import traceback
+        DATA.mkdir(parents=True, exist_ok=True)
+        (DATA / "crash.log").write_text(f"{time.ctime()}\n{traceback.format_exc()}", encoding="utf-8")
+        raise
