@@ -88,3 +88,16 @@ Needs [Inno Setup 6](https://jrsoftware.org/isinfo.php) for the installer.
 ```
 
 The result is `dist\VpnLauncherSetup-1.0.0.exe`.
+
+## Release
+
+Releases are built by GitHub Actions (`.github/workflows/release.yml`). Push a version tag:
+
+```powershell
+git tag v1.0.2
+git push origin v1.0.2
+```
+
+The workflow builds the installer on a clean Windows runner and publishes a release with the
+installer and its SHA-256 checksum. Running the workflow by hand from the Actions tab makes a
+test build that is kept only as a workflow artifact.

@@ -1,0 +1,71 @@
+name: Release
+
+# Pushing a tag like v1.2.3 builds the installer and publishes a GitHub release with it.
+# A manual run builds the same way but only keeps the installer as a workflow artifact.
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version for a test build (nothing is published)"
+        default: "0.0.0"
+
+permissions:
+  contents: write  # needed to create the release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      # The module checks its pure functions with assertions at import time.
+      - name: Self-checks
+        run: python -c "import sys; sys.path.insert(0, 'src'); import vpn_launcher"
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Build
+        shell: pwsh
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          $version = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME.TrimStart("v") } else { $env:INPUT_VERSION }
+          ./build.ps1 -Version $version -Python (Get-Command python).Source
+          $installer = "VpnLauncherSetup-$version.exe"
+          if (-not (Test-Path "dist/$installer")) { throw "The installer was not built." }
+          "$((Get-FileHash "dist/$installer" -Algorithm SHA256).Hash.ToLower())  $installer" |
+            Set-Content "dist/$installer.sha256"
+          "VERSION=$version" >> $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VpnLauncherSetup-${{ env.VERSION }}
+          path: |
+            dist/VpnLauncherSetup-${{ env.VERSION }}.exe
+            dist/VpnLauncherSetup-${{ env.VERSION }}.exe.sha256
+          if-no-files-found: error
+
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create $env:GITHUB_REF_NAME
+          "dist/VpnLauncherSetup-$env:VERSION.exe"
+          "dist/VpnLauncherSetup-$env:VERSION.exe.sha256"
+          --title "VPN Launcher $env:VERSION" --generate-notes
