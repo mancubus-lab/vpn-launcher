@@ -156,11 +156,28 @@ assert find_update({"tag_name": "v9.0.0", "assets": [{"name": "x.exe", "browser_
                    "1.0.0", ".exe") is None
 
 
-def fetch(url, limit=200_000_000):
-    """Downloads a URL over HTTPS and returns the bytes."""
+def fetch(url, limit=200_000_000, progress=None):
+    """Downloads a URL over HTTPS and returns the bytes; progress(done, total) is called as the data arrives."""
     request = urllib.request.Request(url, headers={"User-Agent": "vpn-launcher", "Accept": "application/vnd.github+json"})
     with urllib.request.urlopen(request, timeout=30) as reply:
-        return reply.read(limit)
+        total = int(reply.headers.get("Content-Length") or 0)
+        parts, done = [], 0
+        while done < limit:
+            part = reply.read(min(65536, limit - done))
+            if not part:
+                break
+            parts.append(part)
+            done += len(part)
+            if progress:
+                progress(done, total)
+        return b"".join(parts)
+
+
+def progress_text(done, total):
+    """ "42% (7.3 MB of 17.3 MB)", or just the amount when the server did not say how much is coming."""
+    if total <= 0:
+        return format_bytes(done)
+    return f"{done * 100 // total}% ({format_bytes(done)} of {format_bytes(total)})"
 
 
 def check_update():
@@ -172,13 +189,13 @@ def check_update():
         return None
 
 
-def download_update(update):
+def download_update(update, progress=None):
     """Downloads the installer of an update, checks it against its SHA-256 file and returns the path."""
     _, installer_url, checksum_url = update
     folder = WORK / "update"
     folder.mkdir(parents=True, exist_ok=True)
     expected = fetch(checksum_url, 1000).decode("ascii", "replace").split()[0].lower()
-    data = fetch(installer_url)
+    data = fetch(installer_url, progress=progress)
     if hashlib.sha256(data).hexdigest() != expected:
         raise ValueError("The downloaded update does not match its checksum.")
     path = folder / installer_url.rsplit("/", 1)[-1]
@@ -395,6 +412,7 @@ def load_profiles():
 
 
 assert format_bytes(512) == "512 B" and format_bytes(1536) == "1.5 KB" and format_bytes(3 * 1024 ** 3) == "3.00 GB"
+assert progress_text(512 * 1024, 2 * 1024 * 1024) == "25% (512.0 KB of 2.0 MB)" and progress_text(2048, 0) == "2.0 KB"
 assert parse_traffic(">BYTECOUNT:2048,10\n") == (2048, 10)
 assert parse_traffic("ENTER PASSWORD:SUCCESS: password is correct") is None
 assert traffic_rate((0, 0), (2048, 1024), 2) == (1024, 512) and traffic_rate(None, (1, 1), 2) is None
@@ -1210,13 +1228,22 @@ def main():
                              "VPN connections stay up. The program closes and the installer takes over."):
             return
         app["downloading"] = True  # a second click must not start a second download
+        app["progress"] = (0, 0)
         hint.configure(text=f"Downloading version {update[0]}...")
+
+        def show_progress():
+            # The download thread only stores the numbers; the label is updated here, on Tk's own thread.
+            if app["downloading"]:
+                hint.configure(text=f"Downloading version {update[0]}: {progress_text(*app['progress'])}")
+                root.after(300, show_progress)
 
         def download():
             try:
-                return download_update(update)
+                return download_update(update, lambda done, total: app.__setitem__("progress", (done, total)))
             except (OSError, ValueError, IndexError) as error:
                 return error
+
+        root.after(300, show_progress)
 
         def downloaded(result):
             app["downloading"] = False
