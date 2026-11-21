@@ -24,6 +24,7 @@ import json
 import logging
 import logging.handlers
 import os
+import queue
 import re
 import shutil
 import socket
@@ -1142,8 +1143,24 @@ def main():
         log.see("end")
         log.configure(state="disabled")
 
+    # Background work never touches Tk itself: its result goes through this queue and done() runs on Tk's
+    # own thread. Calling Tk from a worker thread crashes Python ("PyEval_RestoreThread: the GIL is
+    # released") when the main thread is inside a Win32 message loop such as the tray menu at that moment.
+    finished = queue.SimpleQueue()
+
     def background(work, done):
-        threading.Thread(target=lambda: root.after(0, done, work()), daemon=True).start()
+        threading.Thread(target=lambda: finished.put((done, work())), daemon=True).start()
+
+    def deliver():
+        root.after(50, deliver)
+        while not finished.empty():
+            done, result = finished.get()
+            try:
+                done(result)
+            except Exception:
+                journal.exception("Unexpected error")
+
+    root.after(50, deliver)
 
     def toggle(p):
         conn = conns[p["name"]]
@@ -1646,7 +1663,11 @@ def main():
     # The icon next to the clock: gray, orange or green padlock by state, with a menu of the connections.
     # Each platform defines update_tray(), notify(title, text, state) and remove_tray().
     if WINDOWS:
-        # Tk's event loop also pumps the hidden window that receives the icon's messages.
+        # The icon's hidden window lives on a thread of its own with its own message loop. On Tk's thread the
+        # menu's modal loop (TrackPopupMenu) ran Tk's timers inside a Win32 callback, and their Python
+        # callbacks killed the interpreter ("PyEval_RestoreThread: the GIL is released"); reproduced by
+        # choosing About from the menu while the window was hidden. This thread never calls Tk: what the user
+        # picks goes through the same queue as background results, and Tk's thread acts on it.
         # shortcut: the icon is not re-added after an Explorer restart, handle TaskbarCreated if that matters.
         def tray(*call):
             """Shell_NotifyIcon that tolerates a missing icon: after an Explorer restart every call would raise."""
@@ -1655,33 +1676,49 @@ def main():
             except win32gui.error:
                 pass
 
+        def on_tk_thread(action):
+            finished.put((lambda _: action(), None))
+
         def tray_menu():
-            items = menu_items()
+            items = menu_items()  # only reads the shared state
             menu = win32gui.CreatePopupMenu()
             for number, (text, _, enabled) in enumerate(items, 1):
                 flags = win32con.MF_STRING | (0 if enabled else win32con.MF_GRAYED)
                 win32gui.AppendMenu(menu, flags, number, text)
-            win32gui.SetForegroundWindow(tray_hwnd)  # otherwise the menu stays open after a click outside
+            try:
+                win32gui.SetForegroundWindow(tray_hwnd)  # otherwise the menu stays open after a click outside
+            except win32gui.error:
+                pass  # Windows may refuse it; the menu still works, it just closes less eagerly
             x, y = win32gui.GetCursorPos()
             chosen = win32gui.TrackPopupMenu(menu, win32con.TPM_RETURNCMD | win32con.TPM_NONOTIFY,
                                              x, y, 0, tray_hwnd, None)
             win32gui.DestroyMenu(menu)
             if chosen:
-                root.after(0, items[chosen - 1][1])
+                on_tk_thread(items[chosen - 1][1])
 
         def on_tray(hwnd, msg, wparam, lparam):
             if lparam == win32con.WM_LBUTTONUP:
-                show_window()
+                on_tk_thread(show_window)
             elif lparam == win32con.WM_RBUTTONUP:
                 tray_menu()
             return 0
 
-        window_class = win32gui.WNDCLASS()
-        window_class.hInstance = win32api.GetModuleHandle(None)
-        window_class.lpszClassName = "VpnLauncherTray"
-        window_class.lpfnWndProc = {TRAY_MSG: on_tray}
-        tray_hwnd = win32gui.CreateWindow(win32gui.RegisterClass(window_class), "", 0, 0, 0, 0, 0, 0, 0,
-                                          window_class.hInstance, None)
+        tray_ready = threading.Event()
+
+        def run_tray_window():
+            nonlocal tray_hwnd
+            window_class = win32gui.WNDCLASS()
+            window_class.hInstance = win32api.GetModuleHandle(None)
+            window_class.lpszClassName = "VpnLauncherTray"
+            window_class.lpfnWndProc = {TRAY_MSG: on_tray}
+            tray_hwnd = win32gui.CreateWindow(win32gui.RegisterClass(window_class), "", 0, 0, 0, 0, 0, 0, 0,
+                                              window_class.hInstance, None)
+            tray_ready.set()
+            win32gui.PumpMessages()
+
+        tray_hwnd = None
+        threading.Thread(target=run_tray_window, daemon=True).start()
+        tray_ready.wait(10)
         icons = {name: load_icon(name, win32con.SM_CXSMICON) for name in COLORS}
         big_icons = {name: load_icon(name, win32con.SM_CXICON) for name in COLORS}
 
