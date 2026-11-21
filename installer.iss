@@ -53,7 +53,8 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 [Run]
 ; Prerequisites come through winget, which ships with Windows 10 and 11.
 Filename: "{cmd}"; Parameters: "/c winget install --id OpenVPNTechnologies.OpenVPN -e --source winget --silent --accept-package-agreements --accept-source-agreements"; StatusMsg: "Installing the OpenVPN client..."; Flags: runhidden; Check: not OpenVpnInstalled
-Filename: "{cmd}"; Parameters: "/c winget install --id AgileBits.1Password.CLI -e --source winget --silent --accept-package-agreements --accept-source-agreements"; StatusMsg: "Installing the 1Password CLI..."; Flags: runhidden; Tasks: opcli
+; --scope machine: on the machine's PATH, not in the profile of whichever administrator approved the elevation.
+Filename: "{cmd}"; Parameters: "/c winget install --id AgileBits.1Password.CLI -e --source winget --scope machine --silent --accept-package-agreements --accept-source-agreements"; StatusMsg: "Installing the 1Password CLI..."; Flags: runhidden; Tasks: opcli
 ; The OpenVPN interactive service takes free-form options only from Administrators and from this group.
 ; shortcut: {username} is the account that approved the elevation; when an administrator installs for a
 ; standard user, add that user to the group by hand.

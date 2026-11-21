@@ -48,7 +48,6 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$OpenVpn = "C:\Program Files\OpenVPN\bin\openvpn.exe"
 
 $work = Join-Path $env:TEMP "vpn_connect_op\$Name"
 $log = Join-Path $work "openvpn.log"
@@ -59,23 +58,41 @@ $pidFile = Join-Path $work "pid.txt"    # PID of the openvpn.exe of this connect
 # Native commands (op) print UTF-8; without this a non-ASCII password or user name arrives garbled.
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 
+# The 1Password CLI. Right after winget installed it, this process may still carry the PATH from before the
+# installation, so the places winget puts its command links are looked at too.
+function Find-OpCli {
+    $found = Get-Command op -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($found) { return $found.Source }
+    foreach ($candidate in "$env:LOCALAPPDATA\Microsoft\WinGet\Links\op.exe", "$env:ProgramFiles\WinGet\Links\op.exe") {
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+    throw "The 1Password CLI (op) is not installed. Install it with: winget install AgileBits.1Password.CLI"
+}
+
 function Read-OpSecret([string]$Ref) {
-    $value = & op read $Ref
+    $value = & $script:op read $Ref
     if ($LASTEXITCODE -ne 0) { throw "op read failed for $Ref" }
     return $value
 }
 
 # Secret references reject characters such as ':' in item names, so items are addressed by ID.
 function Resolve-OpItemId([string]$ItemName) {
-    $json = & op item get $ItemName --vault $Vault --format json
+    $json = & $script:op item get $ItemName --vault $Vault --format json
     if ($LASTEXITCODE -ne 0) { throw "op item get failed for $ItemName" }
     return ($json | ConvertFrom-Json).id
 }
 
-# The openvpn.exe of this connection, or nothing. The name check guards against a reused PID.
+# The openvpn.exe of this connection, or nothing. A process is only ours when it has our PID, is an openvpn
+# and started when pid.txt was written: after a reboot the number may belong to someone else's OpenVPN.
 function Get-VpnProcess {
     $id = Get-Content $pidFile -TotalCount 1 -ErrorAction SilentlyContinue
-    if ($id) { Get-Process -Id $id -ErrorAction SilentlyContinue | Where-Object ProcessName -eq "openvpn" }
+    if (-not $id) { return }
+    $process = Get-Process -Id $id -ErrorAction SilentlyContinue | Where-Object ProcessName -eq "openvpn"
+    if (-not $process) { return }
+    $written = (Get-Item -LiteralPath $pidFile).LastWriteTime
+    $started = (Get-CimInstance Win32_Process -Filter "ProcessId=$id" -ErrorAction SilentlyContinue).CreationDate
+    if ($started -and ($started -lt $written.AddSeconds(-120) -or $started -gt $written.AddSeconds(5))) { return }
+    $process
 }
 
 # Asks OpenVPN to exit through its management interface, so that it removes its own routes.
@@ -111,7 +128,10 @@ function Start-VpnViaService([string]$Options) {
         $bytes = [Text.Encoding]::Unicode.GetBytes("$work`0$Options`0`0")
         $pipe.Write($bytes, 0, $bytes.Length)
         $buffer = [byte[]]::new(4096)
-        $count = $pipe.Read($buffer, 0, $buffer.Length)
+        # The service normally answers at once; a hung one must not keep this script (and the card) waiting.
+        $reading = $pipe.ReadAsync($buffer, 0, $buffer.Length)
+        if (-not $reading.Wait(20000)) { throw "the OpenVPN service did not answer within 20 seconds" }
+        $count = $reading.Result
         # Reply: error code, then the PID (or error details), one per line, numbers in hex.
         $reply = [Text.Encoding]::Unicode.GetString($buffer, 0, $count) -split "`n"
     }
@@ -179,10 +199,11 @@ $state = "timeout"
 
 try {
     if ($fromOp) {
+        $script:op = Find-OpCli
         $itemId = Resolve-OpItemId $Item
         $profileItemId = if ($ProfileItem -eq $Item) { $itemId } else { Resolve-OpItemId $ProfileItem }
 
-        & op read "op://$Vault/$profileItemId/$ProfileFile" --out-file $cfg --force | Out-Null
+        & $script:op read "op://$Vault/$profileItemId/$ProfileFile" --out-file $cfg --force | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "op read failed for the profile $ProfileFile" }
 
         if ($OtpMode -eq "Auto") {

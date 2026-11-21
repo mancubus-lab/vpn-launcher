@@ -109,9 +109,27 @@ def read_pid(folder):
         return ""
 
 
+def process_start(pid):
+    """When a process started, in seconds since the epoch; None when that cannot be found out."""
+    done = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                          env={**os.environ, "LC_ALL": "C"})  # English day and month names for strptime
+    try:
+        return time.mktime(time.strptime(" ".join(done.stdout.split()), "%a %b %d %H:%M:%S %Y"))
+    except ValueError:
+        return None
+
+
 def is_running(folder):
+    """True while the openvpn process named in pid.txt is ours: the PID may be reused after a reboot."""
     pid = read_pid(folder)
-    return bool(pid) and pid in openvpn_pids()
+    if not pid or pid not in openvpn_pids():
+        return False
+    try:
+        written = (folder / "pid.txt").stat().st_mtime
+    except OSError:
+        return False
+    started = process_start(pid)
+    return started is None or written - 120 <= started <= written + 5
 
 
 def find_openvpn(say):
@@ -136,7 +154,11 @@ def one_password(*arguments):
     tool = find_tool("op")
     if not tool:
         raise VpnError("The 1Password CLI (op) is not installed. Run: brew install 1password-cli")
-    done = subprocess.run([tool, *arguments], capture_output=True, text=True)
+    try:
+        # The time limit covers waiting for the approval in the 1Password app.
+        done = subprocess.run([tool, *arguments], capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        raise VpnError("1Password did not answer within 3 minutes.") from None
     if done.returncode != 0:
         raise VpnError(f"1Password: {done.stderr.strip()}")
     return done.stdout.rstrip("\n")
@@ -293,9 +315,21 @@ def protect(secret):
     # Passed over stdin: a command line would be visible to every process of the user.
     done = subprocess.run(["security", "-i"], capture_output=True, text=True,
                           input=f'add-generic-password -U -a {handle} -s "{KEYCHAIN_SERVICE}" -w "{secret}"\n')
-    if done.returncode != 0:
-        raise OSError(f"The Keychain refused the key: {done.stderr.strip()}")
+    # "security -i" reports success even when a command inside failed: read the entry back to be sure.
+    try:
+        stored = unprotect(handle)
+    except OSError:
+        stored = None
+    if done.returncode != 0 or stored != secret:
+        forget(handle)
+        raise OSError(f"The Keychain did not store the key: {done.stderr.strip()}")
     return handle
+
+
+def forget(handle):
+    """Removes a key that protect() stored; a missing entry is fine."""
+    subprocess.run(["security", "delete-generic-password", "-a", handle, "-s", KEYCHAIN_SERVICE],
+                   capture_output=True, text=True)
 
 
 def unprotect(handle):

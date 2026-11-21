@@ -19,6 +19,7 @@ import base64
 import ctypes
 import hashlib
 import hmac
+import http.client
 import json
 import logging
 import logging.handlers
@@ -51,6 +52,7 @@ if WINDOWS:
     import win32crypt
     import win32event
     import win32gui
+    import win32process
 else:
     import vpn_mac
 
@@ -96,12 +98,13 @@ UPLOAD = "#3b7dd8"
 BRAND = {"bg": "#15171a", "ink": "#ffffff", "muted": "#b9c0c9", "accent": "#ff681c"}
 WEBSITE = "https://mancubus-lab.com/"
 REPOSITORY = "mancubus-lab/vpn-launcher"  # releases of this repository are the update channel
-# The site serves the same release files from Cloudflare: GitHub's file servers can be very slow on some
-# networks. GitHub itself stays as the fallback when the site cannot be reached.
-UPDATE_SOURCES = [
-    ("https://mancubus-lab.com/vpn-launcher/latest.json", "https://mancubus-lab.com/vpn-launcher/download/"),
-    (f"https://api.github.com/repos/{REPOSITORY}/releases/latest", f"https://github.com/{REPOSITORY}/releases/download/"),
-]
+GITHUB_RELEASE = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
+GITHUB_DOWNLOADS = f"https://github.com/{REPOSITORY}/releases/download/"
+# The site serves copies of the release files from Cloudflare, because GitHub's file servers can be very slow
+# on some networks. Only the bytes come from there: which version to install and its checksum always come
+# from GitHub, so the site alone cannot hand out a different installer. GitHub is the fallback download.
+MIRROR_DOWNLOADS = "https://mancubus-lab.com/vpn-launcher/download/"
+INSTALLER_NAME = re.compile(r"[\w.-]+\.(exe|dmg)")  # also keeps the saved file inside the update folder
 UPDATE_CHECK_MS = 6 * 60 * 60 * 1000
 NIIF_USER_LARGE = 0x4 | 0x20  # NIIF_USER | NIIF_LARGE_ICON: the notification shows our icon, not the blue "i"
 # Setting key, checkbox label, default value.
@@ -143,38 +146,48 @@ def parse_version(text):
     return tuple(int(part) for part in found.groups()) if found else None
 
 
-def find_update(release, current, suffix, prefix=f"https://github.com/{REPOSITORY}/releases/download/"):
-    """(version, installer URL, checksum URL) when a release is newer than the running version.
+def find_update(release, current, suffix):
+    """(version, file name, download URLs, checksum) when a GitHub release is newer than the running version.
 
-    suffix picks the download for this system. Only links under prefix (the source the release came from)
-    are accepted, and only an installer together with its .sha256 file.
+    suffix picks the download for this system. The checksum is the SHA-256 that GitHub computed for the file
+    (the asset's "digest"), or for older releases the URL of the .sha256 file published next to it on GitHub.
+    The URLs are tried in order: the mirror on the site, then GitHub.
     """
     latest, running = parse_version(str(release.get("tag_name", ""))), parse_version(current)
     if not latest or not running or latest <= running:
         return None
-    links = {asset.get("name", ""): asset.get("browser_download_url", "") for asset in release.get("assets", [])}
-    links = {name: link for name, link in links.items() if link.startswith(prefix)}
-    installer = next((name for name in links if name.endswith(suffix)), None)
-    if not installer or installer + ".sha256" not in links:
+    assets = {asset.get("name", ""): asset for asset in release.get("assets", [])
+              if str(asset.get("browser_download_url", "")).startswith(GITHUB_DOWNLOADS)}
+    name = next((name for name in assets if name.endswith(suffix) and INSTALLER_NAME.fullmatch(name)), None)
+    if not name:
         return None
-    return ".".join(str(part) for part in latest), links[installer], links[installer + ".sha256"]
+    digest = str(assets[name].get("digest") or "")
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        checksum = digest.split(":")[1]
+    elif name + ".sha256" in assets:
+        checksum = assets[name + ".sha256"]["browser_download_url"]
+    else:
+        return None
+    version = ".".join(str(part) for part in latest)
+    return version, name, [f"{MIRROR_DOWNLOADS}v{version}/{name}", assets[name]["browser_download_url"]], checksum
 
 
-_sample_release = {"tag_name": "v1.2.0", "assets": [
-    {"name": name, "browser_download_url": f"https://github.com/{REPOSITORY}/releases/download/v1.2.0/{name}"}
-    for name in ("Setup-1.2.0.exe", "Setup-1.2.0.exe.sha256", "App-1.2.0-arm64.dmg")]}
-assert parse_version("v1.10.3") == (1, 10, 3) and parse_version("dev") is None
-assert find_update(_sample_release, "1.1.9", ".exe")[0] == "1.2.0"
-assert find_update(_sample_release, "1.2.0", ".exe") is None and find_update(_sample_release, "dev", ".exe") is None
-assert find_update(_sample_release, "1.0.0", ".dmg") is None  # no checksum file next to it
-assert find_update({"tag_name": "v9.0.0", "assets": [{"name": "x.exe", "browser_download_url": "https://evil/x.exe"},
-                                                     {"name": "x.exe.sha256", "browser_download_url": "https://evil/s"}]},
-                   "1.0.0", ".exe") is None
-_site = "https://mancubus-lab.com/vpn-launcher/download/"
-_site_release = {"tag_name": "v1.2.0", "assets": [{"name": name, "browser_download_url": f"{_site}v1.2.0/{name}"}
-                                                  for name in ("Setup-1.2.0.exe", "Setup-1.2.0.exe.sha256")]}
-assert find_update(_site_release, "1.1.0", ".exe", _site)[1] == f"{_site}v1.2.0/Setup-1.2.0.exe"
-assert find_update(_site_release, "1.1.0", ".exe") is None  # site links are not accepted as GitHub ones
+def _sample(names, digest=None, base=GITHUB_DOWNLOADS):
+    return {"tag_name": "v1.2.0", "assets": [
+        {"name": name, "browser_download_url": f"{base}v1.2.0/{name}", **({"digest": digest} if digest else {})}
+        for name in names]}
+
+
+assert parse_version("v1.10.3") == (1, 10, 3) and parse_version("dev") is None and parse_version("1.2.0-dev") is None
+_found = find_update(_sample(["Setup-1.2.0.exe", "Setup-1.2.0.exe.sha256"]), "1.1.9", ".exe")
+assert _found[:2] == ("1.2.0", "Setup-1.2.0.exe") and _found[2][0] == f"{MIRROR_DOWNLOADS}v1.2.0/Setup-1.2.0.exe"
+assert _found[3] == f"{GITHUB_DOWNLOADS}v1.2.0/Setup-1.2.0.exe.sha256"
+assert find_update(_sample(["Setup-1.2.0.exe"], "sha256:" + "a" * 64), "1.1.9", ".exe")[3] == "a" * 64
+assert find_update(_sample(["Setup-1.2.0.exe"]), "1.1.9", ".exe") is None  # no checksum at all
+assert find_update(_sample(["Setup-1.2.0.exe", "Setup-1.2.0.exe.sha256"]), "1.2.0", ".exe") is None
+assert find_update(_sample(["Setup-1.2.0.exe", "Setup-1.2.0.exe.sha256"]), "dev", ".exe") is None
+assert find_update(_sample(["Setup-1.2.0.exe", "Setup-1.2.0.exe.sha256"], base="https://evil/"), "1.0.0", ".exe") is None
+assert find_update(_sample([r"..\x.exe", r"..\x.exe.sha256"]), "1.0.0", ".exe") is None  # unsafe file name
 
 
 class DownloadCancelled(Exception):
@@ -185,6 +198,8 @@ def fetch(url, limit=200_000_000, progress=None):
     """Downloads a URL over HTTPS and returns the bytes; progress(done, total) is called as the data arrives."""
     request = urllib.request.Request(url, headers={"User-Agent": "vpn-launcher", "Accept": "application/vnd.github+json"})
     with urllib.request.urlopen(request, timeout=30) as reply:
+        if not reply.geturl().startswith("https://"):  # a redirect may lead anywhere; plain HTTP is not accepted
+            raise ValueError(f"Refused a redirect to {reply.geturl()}")
         total = int(reply.headers.get("Content-Length") or 0)
         parts, done = [], 0
         while done < limit:
@@ -205,35 +220,42 @@ def progress_text(done, total):
     return f"{done * 100 // total}% ({format_bytes(done)} of {format_bytes(total)})"
 
 
-def check_update():
-    """The newer release for this system as find_update() describes it, or None (also when offline).
+# What a download can fail with: network errors, broken HTTP replies (not OSError), refused redirects.
+NETWORK_ERRORS = (OSError, ValueError, http.client.HTTPException)
 
-    The first source that answers decides; the downloads then come from that same source.
-    """
-    for info_url, prefix in UPDATE_SOURCES:
-        try:
-            release = json.loads(fetch(info_url))
-        except (OSError, ValueError):
-            continue  # unreachable or not JSON: try the next source
-        try:
-            return find_update(release, VERSION, ".exe" if WINDOWS else "-arm64.dmg", prefix)
-        except (AttributeError, TypeError):
-            return None
-    return None
+
+def check_update():
+    """The newer release for this system as find_update() describes it, or None (also when offline)."""
+    try:
+        return find_update(json.loads(fetch(GITHUB_RELEASE)), VERSION, ".exe" if WINDOWS else "-arm64.dmg")
+    except (*NETWORK_ERRORS, AttributeError, TypeError, KeyError):
+        return None
 
 
 def download_update(update, progress=None):
-    """Downloads the installer of an update, checks it against its SHA-256 file and returns the path."""
-    _, installer_url, checksum_url = update
-    folder = WORK / "update"
-    folder.mkdir(parents=True, exist_ok=True)
-    expected = fetch(checksum_url, 1000).decode("ascii", "replace").split()[0].lower()
-    data = fetch(installer_url, progress=progress)
-    if hashlib.sha256(data).hexdigest() != expected:
-        raise ValueError("The downloaded update does not match its checksum.")
-    path = folder / installer_url.rsplit("/", 1)[-1]
-    path.write_bytes(data)
-    return path
+    """Downloads the installer of an update, checks it against the checksum from GitHub and returns the path.
+
+    The mirror is tried first and GitHub second; a copy that does not match the checksum is never kept.
+    """
+    _, name, urls, checksum = update
+    if checksum.startswith("https://"):  # an older release without a digest: its .sha256 file on GitHub
+        checksum = fetch(checksum, 1000).decode("ascii", "replace").split()[0].lower()
+    problems = []
+    for url in urls:
+        try:
+            data = fetch(url, progress=progress)
+        except NETWORK_ERRORS as error:
+            problems.append(f"{url.split('/')[2]}: {error}")
+            continue
+        if hashlib.sha256(data).hexdigest() != checksum:
+            problems.append(f"{url.split('/')[2]}: the file does not match its checksum")
+            continue
+        folder = WORK / "update"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / name
+        path.write_bytes(data)
+        return path
+    raise ValueError("; ".join(problems))
 
 
 def icon_path(state):
@@ -277,6 +299,12 @@ def run_script(*args, stdin_text=""):
         return _run_script(*args, stdin_text=stdin_text)
     except OSError as err:
         return 1, f"PowerShell could not be started: {err}"
+    except subprocess.TimeoutExpired:
+        return 1, f"The connect script did not finish within {SCRIPT_TIMEOUT // 60} minutes and was stopped."
+
+
+# The script gives OpenVPN 90 s to connect; the rest is time to approve 1Password and the slack of a slow start.
+SCRIPT_TIMEOUT = 300
 
 
 def _run_script(*args, stdin_text):
@@ -284,7 +312,7 @@ def _run_script(*args, stdin_text):
         # Bypass: a fresh Windows blocks every script by default; this only covers our own bundled script.
         [PWSH, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", SCRIPT, *args],
         input=stdin_text, capture_output=True, text=True, encoding="utf-8", errors="replace",
-        creationflags=NO_WINDOW,
+        creationflags=NO_WINDOW, timeout=SCRIPT_TIMEOUT,
     )
     return proc.returncode, (proc.stdout + proc.stderr).strip()
 
@@ -407,28 +435,39 @@ RISKY_DIRECTIVES = {
     "up", "down", "route-up", "route-pre-down", "ipchange", "tls-verify", "auth-user-pass-verify",
     "client-connect", "client-disconnect", "learn-address", "tls-crypt-v2-verify", "plugin",
     "pkcs11-providers", "providers", "management", "status", "writepid", "log", "log-append",
+    # Read another file the check cannot see, or write or move files of the profile's choosing.
+    "config", "replay-persist", "tls-export-cert", "cd", "chroot", "tmp-dir", "daemon", "askpass",
 }
 
 
 def risky_directives(profile_text):
-    """Sorted names of the RISKY_DIRECTIVES an .ovpn uses; inline <ca>...</ca> style blocks are skipped."""
+    """Sorted names of the RISKY_DIRECTIVES an .ovpn uses; inline <ca>...</ca> style blocks are skipped.
+
+    Written the way OpenVPN reads a line: the name may be quoted or start with "--", and "setenv opt X"
+    is the directive X itself (only that OpenVPN does not stop when it does not know X).
+    """
     found, inside = set(), False
     for line in profile_text.splitlines():
-        words = line.split()
-        if not words:
+        words = [word.strip("\"'").lower() for word in line.split()]
+        if not words or not words[0]:
             continue
         if words[0].startswith("</"):
             inside = False
         elif words[0].startswith("<"):
             inside = True
-        elif not inside and words[0].lower().lstrip("-") in RISKY_DIRECTIVES:
-            found.add(words[0].lower().lstrip("-"))
+        elif not inside:
+            if words[0].lstrip("-") == "setenv" and len(words) > 2 and words[1] == "opt":
+                words = words[2:]
+            if words[0].lstrip("-") in RISKY_DIRECTIVES:
+                found.add(words[0].lstrip("-"))
     return sorted(found)
 
 
 assert risky_directives("client\nUP 'cmd /c x'\n<ca>\nplugin not-a-directive\n</ca>\n  plugin x.dll\n# up\n") == [
     "plugin", "up"]
-assert risky_directives("client\nremote vpn.example 1194\nscript-security 2\n") == []
+assert risky_directives("client\nremote vpn.example 1194\nscript-security 2\nsetenv FOO bar\n") == []
+assert risky_directives('setenv opt plugin x.so\n"tls-verify" x\nconfig b.conf\nreplay-persist C:/x\n--cd /tmp\n') == [
+    "cd", "config", "plugin", "replay-persist", "tls-verify"]
 
 
 def load_profiles():
@@ -485,6 +524,33 @@ def watch_traffic(name, links, samples):
         samples.pop(name, None)
 
 
+def process_start(pid):
+    """When a process started, in seconds since the epoch; None when that cannot be found out."""
+    if not WINDOWS:
+        return vpn_mac.process_start(pid)
+    try:
+        handle = win32api.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+        try:
+            return win32process.GetProcessTimes(handle)["CreationTime"].timestamp()
+        finally:
+            win32api.CloseHandle(handle)
+    except (win32api.error, ValueError, OverflowError):
+        return None
+
+
+def started_with(started, written):
+    """True when a process that started at `started` can be the one a PID file written at `written` names.
+
+    The file is written a moment after the start (up to about a minute on a slow start through the service).
+    An unknown start time counts as a match: better a stale card than a live VPN shown as off.
+    """
+    return started is None or written - 120 <= started <= written + 5
+
+
+assert started_with(1000, 1003) and started_with(None, 1000)
+assert not started_with(5000, 1000) and not started_with(100, 1000)
+
+
 def vpn_status(names):
     """Returns {name: (state, text, log_text)}; a connection is alive while the PID saved for it is an openvpn process."""
     if WINDOWS:
@@ -499,13 +565,23 @@ def vpn_status(names):
     for name in names:
         pid_file, log_file = WORK / name / "pid.txt", WORK / name / "openvpn.log"
         try:
-            alive = pid_file.read_text().strip() in pids
-            uptime = time.time() - pid_file.stat().st_mtime  # the file is written when openvpn.exe starts
+            pid, written = pid_file.read_text().strip(), pid_file.stat().st_mtime
+            # The file is written when OpenVPN starts. A process with that number that started at another
+            # time is someone else's, which got the number after ours had ended (after a reboot, say).
+            alive = pid in pids and started_with(process_start(pid), written)
+            uptime = time.time() - written
         except OSError:
             alive, uptime = False, 0
         log_text = log_file.read_text(errors="replace") if log_file.exists() else ""
         result[name] = (*parse_status(alive, log_text, uptime), log_text)
     return result
+
+
+def save_json(path, data):
+    """Writes to a side file and swaps it in: a crash mid-write must not leave a truncated file behind."""
+    draft = path.with_suffix(".tmp")
+    draft.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(draft, path)
 
 
 def load_settings():
@@ -817,7 +893,8 @@ def edit_profile(root, profile, taken):
         ttk.Checkbutton(panels["file"], text="Remove the saved key", variable=drop_key).grid(
             row=4, column=1, sticky="w")
     else:
-        ttk.Label(panels["file"], text="Base32 secret of the authenticator; stored encrypted for this Windows user.",
+        ttk.Label(panels["file"], text="Base32 secret of the authenticator; stored encrypted for this Windows user." if WINDOWS
+                  else "Base32 secret of the authenticator; stored in your macOS Keychain.",
                   foreground="gray").grid(row=3, column=1, columnspan=2, sticky="w")
 
     error = ttk.Label(body, text="", foreground="#c0392b", wraplength=420)
@@ -906,6 +983,19 @@ def first_instance():
     return False
 
 
+def release_instance():
+    """Gives up the single-instance mutex before the process ends, so that an installer started now sees none."""
+    if WINDOWS and _instance_mutex:
+        try:
+            win32event.ReleaseMutex(_instance_mutex)
+            win32api.CloseHandle(_instance_mutex)
+        except win32api.error:
+            pass  # not owned or already closed: nothing left to give up
+
+
+_instance_mutex = None
+
+
 def main():
     if WINDOWS:
         # Without this Windows bitmap-scales the window on a scaled display and it looks blurry.
@@ -956,11 +1046,8 @@ def main():
         mark = None  # the logo file is missing: the header shows the text alone
     titles = tk.Frame(header, bg=BRAND["bg"])
     titles.pack(side="left")
-    title_row = tk.Frame(titles, bg=BRAND["bg"])
-    title_row.pack(anchor="w")
-    tk.Label(title_row, text="VPN Launcher", bg=BRAND["bg"], fg=BRAND["ink"], font=("Segoe UI Semibold", 14)).pack(side="left")
-    tk.Label(title_row, text=f"v{VERSION}", bg=BRAND["bg"], fg=BRAND["muted"], font=("Segoe UI", 9)).pack(
-        side="left", padx=(8, 0), anchor="s", pady=(0, 3))
+    # The version is in the window title (and in About): repeating it here would only add noise.
+    tk.Label(titles, text="VPN Launcher", bg=BRAND["bg"], fg=BRAND["ink"], font=("Segoe UI Semibold", 14)).pack(anchor="w")
     summary = tk.Label(titles, text="Checking...", bg=BRAND["bg"], fg=BRAND["muted"], font=("Segoe UI", 9))
     summary.pack(anchor="w")
     pill_button(header, "About", lambda: about()).pack(side="right")
@@ -1045,10 +1132,7 @@ def main():
             start(p["name"], "Disconnecting...", "", ["-Disconnect"])
 
     def save_profiles(items):
-        # Written to a side file and swapped in: a crash mid-write must not leave a truncated profile list.
-        draft = PROFILES.with_suffix(".tmp")
-        draft.write_text(json.dumps(items, indent=2, ensure_ascii=False), encoding="utf-8")
-        os.replace(draft, PROFILES)
+        save_json(PROFILES, items)
 
     def edit(p):
         """Adds (p is None), changes or deletes a profile, then restarts the program to rebuild the cards."""
@@ -1077,6 +1161,10 @@ def main():
         imported = Path((p or {}).get("profile_path") or "-")
         if imported.parent == PROFILE_DIR and str(imported) not in {item.get("profile_path") for item in items}:
             imported.unlink(missing_ok=True)
+        # The same for a one-time code key in the macOS Keychain (on Windows the key lives in the file only).
+        old_key = (p or {}).get("otp_key")
+        if not WINDOWS and old_key and old_key not in {item.get("otp_key") for item in items}:
+            vpn_mac.forget(old_key)
         restart()
 
     scale = display_scale(root)
@@ -1283,14 +1371,33 @@ def main():
         update_tray()  # after notify: it restores the small tray icon
 
     def check_now():
-        background(lambda: vpn_status(names), show_status)
+        # One check at a time: when one is slow, overlapping ones would apply their results out of order
+        # (a state flickering on and off, notifications twice). The next tick simply tries again.
+        if app.get("polling"):
+            return
+        app["polling"] = True
+
+        def checked(result):
+            app["polling"] = False
+            if isinstance(result, Exception):
+                journal.error("Status check failed", exc_info=result)
+            else:
+                show_status(result)
+
+        def check():
+            try:
+                return vpn_status(names)
+            except Exception as error:  # a failed check must not leave "polling" set for good
+                return error
+
+        background(check, checked)
 
     def refresh():
         root.after(REFRESH_MS, refresh)  # first, so that an error below cannot stop the polling for good
         # The window's place and size are remembered as they change, so even a reboot does not lose them.
         if root.state() == "normal" and root.geometry() != settings.get("geometry"):
             settings["geometry"] = root.geometry()
-            SETTINGS.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+            save_json(SETTINGS, settings)
         # The colours are taken at start-up, so a theme change (in the settings, or in Windows with "Auto")
         # restarts the program: now if nothing is going on, otherwise on a later tick.
         if resolve_theme(settings["theme"]) != theme and not root.grab_current() and restart():
@@ -1377,7 +1484,7 @@ def main():
         def download():
             try:
                 return download_update(update, progress)
-            except (OSError, ValueError, IndexError, DownloadCancelled) as error:
+            except Exception as error:  # anything at all: an uncaught one would leave the download "running"
                 return error
 
         root.after(300, show_progress)
@@ -1394,8 +1501,12 @@ def main():
             say(f"Starting the installer of version {update[0]}: {result}")
             if WINDOWS:
                 # /SILENT: no wizard pages. The installer asks for elevation itself and restarts the program.
-                ctypes.windll.shell32.ShellExecuteW(None, "open", str(result), "/SILENT", None, 1)
-                quit_app()  # the installer waits for the program to be closed
+                # A result of 32 or less is a failure, including "No" in the elevation prompt: then stay open.
+                if ctypes.windll.shell32.ShellExecuteW(None, "open", str(result), "/SILENT", None, 1) <= 32:
+                    hint.configure(text=f"The installer of version {update[0]} was not started.")
+                    return
+                release_instance()  # the installer must not find the program still running
+                quit_app()
             else:
                 # shortcut: on macOS the disk image is opened for the usual drag to Applications.
                 subprocess.run(["open", str(result)])
@@ -1415,7 +1526,7 @@ def main():
 
     def on_toggle(key):
         settings[key] = checks[key].get()
-        SETTINGS.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        save_json(SETTINGS, settings)
         if key == "autostart":
             set_autostart(settings[key])
         if key == "show_log":
@@ -1432,7 +1543,7 @@ def main():
 
     def on_theme(event):
         settings["theme"] = THEMES[theme_choice.get()]
-        SETTINGS.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        save_json(SETTINGS, settings)
         restart()  # if an action is running, refresh() does it once that has finished
 
     theme_row = ttk.Frame(box)

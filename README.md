@@ -48,7 +48,8 @@
 - 🖥️ **Tray icon or menu bar item** with a menu, notifications and autostart.
 - 🌗 **Light, dark and automatic theme.**
 - ⬆️ **Self-update** — the launcher checks the releases of this repository, and one click downloads the
-  new installer, verifies its SHA-256 checksum and installs it. VPN connections stay up meanwhile.
+  new installer (from the mancubus-lab.com mirror, or from GitHub when the mirror fails), verifies it against
+  the SHA-256 checksum GitHub reports for the release and installs it. VPN connections stay up meanwhile.
 - 📜 **A journal** in the window, also written to a log file (about 2 MB at most).
 
 ## 🪟 Windows
@@ -136,7 +137,7 @@ twice does not bring the first window forward; DNS servers pushed by the VPN ser
   group. Setup adds the account that approved the elevation; add other accounts by hand.
 - Only one instance runs at a time; on Windows starting it again brings the running window to the front.
 - Updates are read from the public releases of this repository; a copy run from a checkout never updates
-  itself. On macOS the update opens the new disk image and the app is dragged to Applications by hand.
+  itself. The mirror only serves bytes: which version to install and its checksum always come from GitHub. On macOS the update opens the new disk image and the app is dragged to Applications by hand.
 
 ---
 
