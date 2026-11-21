@@ -213,10 +213,10 @@ def traffic_rate(previous, current, seconds):
     return tuple(max(now - before, 0) / seconds for before, now in zip(previous, current))
 
 
-def traffic_text(rate, totals):
-    """Current speed (when known) plus the totals of the session."""
-    total = f"total  ↓ {format_bytes(totals[0])}   ↑ {format_bytes(totals[1])}"
-    return f"↓ {format_bytes(rate[0])}/s   ↑ {format_bytes(rate[1])}/s   ·   {total}" if rate else total
+def traffic_cells(rate, totals):
+    """Texts of the two-row traffic table: arrow, current speed (when known), "total", session total."""
+    return [text for index, arrow in enumerate("↓↑")
+            for text in (arrow, f"{format_bytes(rate[index])}/s" if rate else "", "total", format_bytes(totals[index]))]
 
 
 def graph_points(values, width, height, peak):
@@ -314,8 +314,8 @@ assert format_bytes(512) == "512 B" and format_bytes(1536) == "1.5 KB" and forma
 assert parse_traffic(">BYTECOUNT:2048,10\n") == (2048, 10)
 assert parse_traffic("ENTER PASSWORD:SUCCESS: password is correct") is None
 assert traffic_rate((0, 0), (2048, 1024), 2) == (1024, 512) and traffic_rate(None, (1, 1), 2) is None
-assert traffic_text((1024, 512), (2048, 1024)) == "↓ 1.0 KB/s   ↑ 512 B/s   ·   total  ↓ 2.0 KB   ↑ 1.0 KB"
-assert traffic_text(None, (2048, 1024)) == "total  ↓ 2.0 KB   ↑ 1.0 KB"
+assert traffic_cells((1024, 512), (2048, 1024)) == ["↓", "1.0 KB/s", "total", "2.0 KB", "↑", "512 B/s", "total", "1.0 KB"]
+assert traffic_cells(None, (2048, 1024))[:4] == ["↓", "", "total", "2.0 KB"]
 assert graph_points([0, 10], 59, 24, 10) == [0, 22, 1, 2]
 check_profile({"name": "Lab", "source": "file", "profile_path": "x.ovpn"})
 for bad in ({"name": "a b", "vault": "v", "item": "i", "profile_file": "f"}, {"name": "Lab", "source": "file"}):
@@ -867,9 +867,17 @@ def main():
         button.grid(row=0, column=3, rowspan=3, padx=(16, 0))
         edit_button = ttk.Button(card, text="Edit", width=5, command=lambda p=p: edit(p))
         edit_button.grid(row=0, column=4, rowspan=3, padx=(8, 0))
-        # A fixed width: otherwise every change in the length of the numbers would resize the whole window.
-        flow = tk.Label(card, text="", bg=ui["card"], fg=ui["muted"], font=("Segoe UI", 9), width=52, anchor="w")
-        flow.grid(row=2, column=1, sticky="w")
+        # Traffic as a small table, download above upload. Every cell has a fixed width and the numbers are
+        # right-aligned, so changing digits neither shift their neighbours nor resize the window.
+        table = tk.Frame(card, bg=ui["card"])
+        table.grid(row=2, column=1, sticky="w")
+        flow = []
+        for index in range(8):
+            width, anchor = ((2, "w"), (11, "e"), (7, "e"), (10, "e"))[index % 4]
+            cell = tk.Label(table, text="", bg=ui["card"], fg=ui["muted"], font=("Segoe UI", 9),
+                            width=width, anchor=anchor, pady=0)
+            cell.grid(row=index // 4, column=index % 4)
+            flow.append(cell)
         graph = tk.Canvas(card, width=graph_size[0], height=graph_size[1], bg=ui["card"], highlightthickness=0)
         graph.grid(row=0, column=2, rowspan=3, padx=(16, 0))
         cards[p["name"]] = lamp, line, button, flow, graph, edit_button
@@ -924,7 +932,8 @@ def main():
             cards[name][1].configure(text=text, fg=COLORS[new])
             if new != "on":
                 conn["traffic"], conn["rates"] = None, []
-                cards[name][3].configure(text="")
+                for cell in cards[name][3]:
+                    cell.configure(text="")
                 draw_graph(name)
             elif not conn["busy"]:
                 if name not in links:
@@ -933,7 +942,8 @@ def main():
                 sample, last = samples.get(name), conn["traffic"]
                 if sample and sample != last:  # no new sample: the previous line stays
                     rate = traffic_rate(last and last[1:], sample[1:], sample[0] - last[0] if last else 0)
-                    cards[name][3].configure(text=traffic_text(rate, sample[1:]))
+                    for cell, text in zip(cards[name][3], traffic_cells(rate, sample[1:])):
+                        cell.configure(text=text)
                     conn["traffic"] = sample
                     if rate:
                         conn["rates"] = [*conn["rates"], rate][-GRAPH_POINTS:]
