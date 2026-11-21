@@ -32,8 +32,13 @@ foreach ($path in $Python, $source, $script, $icon) {
     if (-not (Test-Path $path)) { throw "Missing: $path" }
 }
 
+# The program reads its version from this file (About window, update check).
+New-Item -ItemType Directory -Force "$here\build" | Out-Null
+[IO.File]::WriteAllText("$here\build\version.txt", $Version)
+
 & $Python -m PyInstaller --noconfirm --clean --windowed --name "VPN Launcher" --icon $icon `
-    --add-data "$script;." --collect-data sv_ttk `
+    --add-data "$script;." --add-data "$here\build\version.txt;." --add-data "$here\assets\mancubus-lab.png;." `
+    --collect-data sv_ttk `
     --distpath "$here\dist" --workpath "$here\build" --specpath "$here\build" $source
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed." }
 

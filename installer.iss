@@ -60,6 +60,8 @@ Filename: "{cmd}"; Parameters: "/c winget install --id AgileBits.1Password.CLI -
 Filename: "{sys}\net.exe"; Parameters: "localgroup ""OpenVPN Administrators"" /add"; Flags: runhidden
 Filename: "{sys}\net.exe"; Parameters: "localgroup ""OpenVPN Administrators"" ""{username}"" /add"; Flags: runhidden
 Filename: "{app}\VPN Launcher.exe"; Parameters: "--show"; Description: "Start VPN Launcher"; Flags: nowait postinstall skipifsilent runasoriginaluser
+; The program updates itself by running this installer with /SILENT: bring it back afterwards.
+Filename: "{app}\VPN Launcher.exe"; Parameters: "--show"; Flags: nowait runasoriginaluser; Check: WizardSilent
 
 [Code]
 function OpenVpnInstalled: Boolean;

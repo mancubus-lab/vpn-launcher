@@ -169,8 +169,9 @@ if ($running) { throw "${Name} is already running. Run with -Disconnect first." 
 
 New-Item -ItemType Directory -Force $work | Out-Null
 $fromOp = $PSCmdlet.ParameterSetName -eq "Connect"
-# The user's own profile file is used in place; only the copy fetched from 1Password is temporary.
-$cfg = if ($fromOp) { Join-Path $work "profile.ovpn" } else { (Resolve-Path $ProfilePath).Path }
+# OpenVPN always gets a temporary copy in the work folder, fetched from 1Password or copied from the user's
+# file: started through the service it exits at once on a profile under %APPDATA%, while one here works.
+$cfg = Join-Path $work "profile.ovpn"
 $creds = Join-Path $work "creds.txt"
 Remove-Item $creds -ErrorAction SilentlyContinue  # left behind if an earlier run was killed before its cleanup
 $state = "timeout"
@@ -195,6 +196,7 @@ try {
         $authNote = "OTP mode was $OtpMode"
     }
     else {
+        Copy-Item -LiteralPath $ProfilePath -Destination $cfg -Force
         # Stdin instead of arguments: a command line is visible to every process of the user.
         [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
         $user = [Console]::In.ReadLine()
@@ -238,8 +240,7 @@ try {
     }
 }
 finally {
-    Remove-Item $creds -ErrorAction SilentlyContinue
-    if ($fromOp) { Remove-Item $cfg -ErrorAction SilentlyContinue }
+    Remove-Item $creds, $cfg -ErrorAction SilentlyContinue
 }
 
 if ($state -ne "connected") {

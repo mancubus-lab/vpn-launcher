@@ -31,7 +31,9 @@ import sys
 import threading
 import time
 import tkinter as tk
+import urllib.request
 import uuid
+import webbrowser
 from pathlib import Path
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 
@@ -90,6 +92,11 @@ PALETTES = {
              "text": "#ffffff", "log": "#d4d4d4"},
 }
 UPLOAD = "#3b7dd8"
+# Mancubus Lab colours for the header: the same in both themes.
+BRAND = {"bg": "#15171a", "ink": "#ffffff", "muted": "#b9c0c9", "accent": "#ff681c"}
+WEBSITE = "https://mancubus-lab.com/"
+REPOSITORY = "mancubus-lab/vpn-launcher"  # releases of this repository are the update channel
+UPDATE_CHECK_MS = 6 * 60 * 60 * 1000
 NIIF_USER_LARGE = 0x4 | 0x20  # NIIF_USER | NIIF_LARGE_ICON: the notification shows our icon, not the blue "i"
 # Setting key, checkbox label, default value.
 CHECKBOXES = [
@@ -98,8 +105,85 @@ CHECKBOXES = [
     ("close_to_tray", "Close button minimizes to tray" if WINDOWS else "Close button hides to the menu bar", True),
     ("notify", "Show connection notifications", True),
     ("show_log", "Show log", False),
+    ("check_updates", "Check for updates automatically", True),
 ]
 THEMES = {"Auto": "auto", "Light": "light", "Dark": "dark"}  # label in the settings -> stored value
+
+
+def resource(name):
+    """A bundled file: next to the code in a build, in assets/ when running from a checkout."""
+    bundled = RESOURCES / name
+    return bundled if bundled.exists() else RESOURCES.parent / "assets" / name
+
+
+# The build writes the release version into version.txt; a checkout has none and never offers updates.
+VERSION = resource("version.txt").read_text().strip() if resource("version.txt").exists() else "dev"
+
+
+def parse_version(text):
+    """(1, 2, 3) for "1.2.3" or "v1.2.3"; None for anything else, including "dev"."""
+    found = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", text.strip())
+    return tuple(int(part) for part in found.groups()) if found else None
+
+
+def find_update(release, current, suffix):
+    """(version, installer URL, checksum URL) when a GitHub release is newer than the running version.
+
+    suffix picks the download for this system. Only files of our own repository's releases are accepted,
+    and only together with their .sha256 file.
+    """
+    latest, running = parse_version(str(release.get("tag_name", ""))), parse_version(current)
+    if not latest or not running or latest <= running:
+        return None
+    prefix = f"https://github.com/{REPOSITORY}/releases/download/"
+    links = {asset.get("name", ""): asset.get("browser_download_url", "") for asset in release.get("assets", [])}
+    links = {name: link for name, link in links.items() if link.startswith(prefix)}
+    installer = next((name for name in links if name.endswith(suffix)), None)
+    if not installer or installer + ".sha256" not in links:
+        return None
+    return ".".join(str(part) for part in latest), links[installer], links[installer + ".sha256"]
+
+
+_sample_release = {"tag_name": "v1.2.0", "assets": [
+    {"name": name, "browser_download_url": f"https://github.com/{REPOSITORY}/releases/download/v1.2.0/{name}"}
+    for name in ("Setup-1.2.0.exe", "Setup-1.2.0.exe.sha256", "App-1.2.0-arm64.dmg")]}
+assert parse_version("v1.10.3") == (1, 10, 3) and parse_version("dev") is None
+assert find_update(_sample_release, "1.1.9", ".exe")[0] == "1.2.0"
+assert find_update(_sample_release, "1.2.0", ".exe") is None and find_update(_sample_release, "dev", ".exe") is None
+assert find_update(_sample_release, "1.0.0", ".dmg") is None  # no checksum file next to it
+assert find_update({"tag_name": "v9.0.0", "assets": [{"name": "x.exe", "browser_download_url": "https://evil/x.exe"},
+                                                     {"name": "x.exe.sha256", "browser_download_url": "https://evil/s"}]},
+                   "1.0.0", ".exe") is None
+
+
+def fetch(url, limit=200_000_000):
+    """Downloads a URL over HTTPS and returns the bytes."""
+    request = urllib.request.Request(url, headers={"User-Agent": "vpn-launcher", "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(request, timeout=30) as reply:
+        return reply.read(limit)
+
+
+def check_update():
+    """The newer release for this system as find_update() describes it, or None (also when offline)."""
+    try:
+        release = json.loads(fetch(f"https://api.github.com/repos/{REPOSITORY}/releases/latest"))
+        return find_update(release, VERSION, ".exe" if WINDOWS else "-arm64.dmg")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def download_update(update):
+    """Downloads the installer of an update, checks it against its SHA-256 file and returns the path."""
+    _, installer_url, checksum_url = update
+    folder = WORK / "update"
+    folder.mkdir(parents=True, exist_ok=True)
+    expected = fetch(checksum_url, 1000).decode("ascii", "replace").split()[0].lower()
+    data = fetch(installer_url)
+    if hashlib.sha256(data).hexdigest() != expected:
+        raise ValueError("The downloaded update does not match its checksum.")
+    path = folder / installer_url.rsplit("/", 1)[-1]
+    path.write_bytes(data)
+    return path
 
 
 def icon_path(state):
@@ -511,6 +595,76 @@ def field(parent, row, label, variable, **options):
     return entry
 
 
+def pill_button(parent, text, command, primary=False):
+    """Rounded button for the dark branded areas, where the themed ttk buttons look out of place.
+
+    The shape is a picture drawn with Pillow (Tk has no rounded widgets) with the text centred on it;
+    primary=True gives the orange accent button, otherwise a quiet dark one.
+    """
+    scale = display_scale(parent)
+    font = tkfont.Font(family="Segoe UI", size=10)
+    width = font.measure(text) + round(30 * scale)
+    height = font.metrics("linespace") + round(14 * scale)
+
+    def shape(color):
+        # Drawn four times larger and scaled down: that is what smooths the corners.
+        large = Image.new("RGBA", (width * 4, height * 4), (0, 0, 0, 0))
+        ImageDraw.Draw(large).rounded_rectangle((0, 0, width * 4 - 1, height * 4 - 1),
+                                                radius=round(7 * scale) * 4, fill=color)
+        return ImageTk.PhotoImage(large.resize((width, height), Image.LANCZOS))
+
+    normal, hover = (shape(BRAND["accent"]), shape("#ff8647")) if primary else (shape("#2a2f36"), shape("#3b424c"))
+    button = tk.Label(parent, image=normal, text=text, compound="center", font=font, fg=BRAND["ink"],
+                      bg=BRAND["bg"], cursor="hand2", borderwidth=0, takefocus=True)
+    button.shapes = normal, hover  # Tk does not keep the pictures alive by itself
+    button.bind("<Enter>", lambda event: button.configure(image=hover))
+    button.bind("<Leave>", lambda event: button.configure(image=normal))
+    button.bind("<Button-1>", lambda event: command())
+    button.bind("<Return>", lambda event: command())
+    return button
+
+
+def show_about(root, check_for_updates):
+    """About window in the Mancubus Lab colours: logo, version, copyright and a link to the site."""
+    box = new_dialog(root)
+    box.configure(bg=BRAND["bg"])
+    body = tk.Frame(box, bg=BRAND["bg"], padx=44, pady=30)
+    body.pack()
+
+    def text(content, color, font, **packing):
+        label = tk.Label(body, text=content, bg=BRAND["bg"], fg=color, font=font)
+        label.pack(**packing)
+        return label
+
+    try:
+        side = round(104 * display_scale(root))
+        logo = ImageTk.PhotoImage(Image.open(resource("mancubus-lab.png")).resize((side, side), Image.LANCZOS))
+        picture = tk.Label(body, image=logo, bg=BRAND["bg"])
+        picture.image = logo  # Tk does not keep the picture alive by itself
+        picture.pack()
+    except OSError:
+        pass  # the logo file is missing: the text below says the same
+    text("VPN Launcher", BRAND["ink"], ("Segoe UI Semibold", 17), pady=(16, 0))
+    text(f"Version {VERSION}", BRAND["muted"], ("Segoe UI", 10))
+    text("One-click OpenVPN connections with one-time codes.", BRAND["muted"], ("Segoe UI", 10), pady=(12, 14))
+    link = text("mancubus-lab.com", BRAND["accent"], ("Segoe UI", 11, "underline"))
+    link.configure(cursor="hand2")
+    link.bind("<Button-1>", lambda event: webbrowser.open(WEBSITE))
+    text("© 2026 Mancubus Lab", BRAND["muted"], ("Segoe UI", 9), pady=(6, 18))
+
+    def check():
+        box.destroy()
+        check_for_updates()
+
+    row = tk.Frame(body, bg=BRAND["bg"])
+    row.pack()
+    pill_button(row, "Check for updates", check).pack(side="left", padx=5)
+    close = pill_button(row, "Close", box.destroy, primary=True)
+    close.pack(side="left", padx=5)
+    box.bind("<Escape>", lambda event: box.destroy())
+    show_modal(root, box, close)
+
+
 def ask_credentials(root, name, username):
     """Asks for the user name and the password of a profile without 1Password; (user, password) or None."""
     answer = []
@@ -733,8 +887,26 @@ def main():
     # traffic is the last sample: (time, bytes in, bytes out).
     # rates is the history for the graph: (bytes per second down, up).
     conns = {name: {"vpn": None, "busy": "", "log": "", "traffic": None, "rates": []} for name in names}
-    app = {"overall": None}
+    app = {"overall": None, "update": None}
     links, samples = {}, {}  # per connection: the open management link and the newest (time, in, out)
+
+    # Header in the Mancubus Lab colours: logo, name, a one-line summary, and the About and update buttons.
+    header = tk.Frame(root, bg=BRAND["bg"], padx=18, pady=12)
+    header.pack(fill="x")
+    tk.Frame(root, bg=BRAND["accent"], height=max(round(3 * display_scale(root)), 2)).pack(fill="x")
+    try:
+        mark_side = round(40 * display_scale(root))
+        mark = ImageTk.PhotoImage(Image.open(resource("mancubus-lab.png")).resize((mark_side, mark_side), Image.LANCZOS))
+        tk.Label(header, image=mark, bg=BRAND["bg"]).pack(side="left", padx=(0, 12))
+    except OSError:
+        mark = None  # the logo file is missing: the header shows the text alone
+    titles = tk.Frame(header, bg=BRAND["bg"])
+    titles.pack(side="left")
+    tk.Label(titles, text="VPN Launcher", bg=BRAND["bg"], fg=BRAND["ink"], font=("Segoe UI Semibold", 14)).pack(anchor="w")
+    summary = tk.Label(titles, text="Checking...", bg=BRAND["bg"], fg=BRAND["muted"], font=("Segoe UI", 9))
+    summary.pack(anchor="w")
+    pill_button(header, "About", lambda: about()).pack(side="right")
+    # The orange update button is put here by look_for_update() when a newer release exists.
 
     frame = ttk.Frame(root, padding=16)
     frame.pack(fill="both", expand=True)
@@ -855,8 +1027,13 @@ def main():
     # One card per connection: padlock indicator, name, status line, traffic graph and its own buttons.
     cards = {}
     for p in profiles:
-        card = tk.Frame(frame, bg=ui["card"], highlightthickness=1, highlightbackground=ui["border"], padx=16, pady=12)
-        card.pack(fill="x", pady=(0, 10))
+        # The outer frame is the card's border and holds a stripe in the state colour along the left edge.
+        shell = tk.Frame(frame, bg=ui["card"], highlightthickness=1, highlightbackground=ui["border"])
+        shell.pack(fill="x", pady=(0, 10))
+        stripe = tk.Frame(shell, bg=COLORS["off"], width=max(round(5 * display_scale(root)), 3))
+        stripe.pack(side="left", fill="y")
+        card = tk.Frame(shell, bg=ui["card"], padx=14, pady=12)
+        card.pack(side="left", fill="both", expand=True)
         card.columnconfigure(1, weight=1)
         lamp = tk.Label(card, image=pictures["off"], bg=ui["card"])
         lamp.grid(row=0, column=0, rowspan=3, padx=(0, 14))
@@ -880,7 +1057,7 @@ def main():
             flow.append(cell)
         graph = tk.Canvas(card, width=graph_size[0], height=graph_size[1], bg=ui["card"], highlightthickness=0)
         graph.grid(row=0, column=2, rowspan=3, padx=(16, 0))
-        cards[p["name"]] = lamp, line, button, flow, graph, edit_button
+        cards[p["name"]] = lamp, line, button, flow, graph, edit_button, stripe
 
     ttk.Button(frame, text="+  Add profile", command=lambda: edit(None)).pack(anchor="w", pady=(0, 6))
 
@@ -898,6 +1075,8 @@ def main():
         graph.create_polygon(down[0], height - 1, *down, down[-2], height - 1, fill=ui["fill"], outline="")
         graph.create_line(*down, fill=COLORS["on"], width=thick)
         graph.create_line(*graph_points([pair[1] for pair in rates], width, height, peak), fill=UPLOAD, width=thick)
+        # The scale of the graph: its highest value in the window shown.
+        graph.create_text(2, 0, anchor="nw", text=f"peak {format_bytes(peak)}/s", fill=ui["muted"], font=("Segoe UI", 7))
 
     hint = ttk.Label(frame, text="" if profiles else "No profiles yet: add one to get started.",
                      foreground="gray", wraplength=360)
@@ -909,6 +1088,7 @@ def main():
         lamp, line, button = cards[name][:3]
         shown = conn["vpn"] or "off"
         lamp.configure(image=pictures["connecting" if conn["busy"] else shown])
+        cards[name][6].configure(bg=COLORS["connecting" if conn["busy"] else shown])
         # The accent colour marks the action that starts something; Disconnect stays neutral.
         button.configure(text=conn["busy"] or ("Connect" if shown == "off" else "Disconnect"),
                          style="Accent.TButton" if shown == "off" and not conn["busy"] else "TButton")
@@ -951,6 +1131,9 @@ def main():
             update_card(name)
             if previous and previous != new and (new == "on" or previous == "on"):
                 notify(f"{name}: VPN connected" if new == "on" else f"{name}: VPN disconnected", text, new)
+        up = sum(conn["vpn"] == "on" for conn in conns.values())
+        summary.configure(text=f"{up} of {len(conns)} connected" if up else "Not connected",
+                          fg=COLORS["on"] if up else BRAND["muted"])
         overall = overall_state([conn["vpn"] for conn in conns.values()])
         if overall != app["overall"]:
             app["overall"] = overall
@@ -992,6 +1175,69 @@ def main():
         say(busy, name)
         background(lambda: run_script("-Name", name, *args, stdin_text=stdin_text),
                    lambda result: finish(name, result))
+
+    def look_for_update(asked=False):
+        """Asks GitHub for a newer release; asked=True when the user pressed the button and wants an answer."""
+        def shown(found):
+            if found and found != app["update"]:
+                if app.get("update_button"):
+                    app["update_button"].destroy()
+                app["update_button"] = pill_button(header, f"Update to {found[0]}", install_update, primary=True)
+                app["update_button"].pack(side="right", padx=(0, 10))
+            app["update"] = found
+            if found:
+                if asked:
+                    hint.configure(text=f"Version {found[0]} is available: press the update button at the top.")
+            elif asked:
+                hint.configure(text="This is a development copy, it does not update itself." if VERSION == "dev"
+                               else f"Version {VERSION} is the latest one, or the update server cannot be reached.")
+        background(check_update, shown)
+
+    def automatic_update_check():
+        root.after(UPDATE_CHECK_MS, automatic_update_check)
+        if settings["check_updates"]:
+            look_for_update()
+
+    def install_update():
+        """Downloads the new installer, checks it and hands over to it; VPN connections keep running."""
+        update = app["update"]
+        if not update or root.grab_current() or app.get("downloading"):
+            return
+        if any(conn["busy"] for conn in conns.values()):
+            hint.configure(text="Wait until the running connect or disconnect has finished.")
+            return
+        if not confirm(root, f"Download and install version {update[0]}?\n\n"
+                             "VPN connections stay up. The program closes and the installer takes over."):
+            return
+        app["downloading"] = True  # a second click must not start a second download
+        hint.configure(text=f"Downloading version {update[0]}...")
+
+        def download():
+            try:
+                return download_update(update)
+            except (OSError, ValueError, IndexError) as error:
+                return error
+
+        def downloaded(result):
+            app["downloading"] = False
+            if isinstance(result, Exception):
+                hint.configure(text=f"The update could not be downloaded: {result}")
+                return
+            say(f"Starting the installer of version {update[0]}: {result}")
+            if WINDOWS:
+                # /SILENT: no wizard pages. The installer asks for elevation itself and restarts the program.
+                ctypes.windll.shell32.ShellExecuteW(None, "open", str(result), "/SILENT", None, 1)
+                quit_app()  # the installer waits for the program to be closed
+            else:
+                # shortcut: on macOS the disk image is opened for the usual drag to Applications.
+                subprocess.run(["open", str(result)])
+                hint.configure(text="Quit VPN Launcher, then drag the new version to Applications.")
+
+        background(download, downloaded)
+
+    def about():
+        if not root.grab_current():
+            show_about(root, lambda: look_for_update(asked=True))
 
     # Settings as checkboxes; every change is saved and applied immediately.
     box = ttk.LabelFrame(frame, text="Settings", padding=(12, 6))
@@ -1060,7 +1306,7 @@ def main():
             conn = conns[p["name"]]
             verb = "Disconnect" if conn["vpn"] in ("connecting", "on") else "Connect"
             items.append((f"{verb} {p['name']}", lambda p=p: toggle(p), not conn["busy"] and conn["vpn"] is not None))
-        return items + [("Open window", show_window, True), ("Exit", quit_app, True)]
+        return items + [("Open window", show_window, True), ("About", about, True), ("Exit", quit_app, True)]
 
     def tray_tip():
         words = {None: "checking", "off": "off", "connecting": "connecting", "on": "connected"}
@@ -1149,6 +1395,7 @@ def main():
         root.report_callback_exception = lambda *error: (journal.error("Smoke test", exc_info=error), os._exit(1))
         root.after(5000, quit_app)
 
+    root.after(4000, automatic_update_check)
     refresh()
     root.mainloop()
 
