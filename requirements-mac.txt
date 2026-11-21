@@ -2,5 +2,6 @@
 pillow==12.2.0
 sv_ttk==2.6.1
 pyinstaller==6.22.3
-# The menu bar item. Not pinned yet: the build prints "pip freeze", pin the version it reports.
-pyobjc-framework-Cocoa
+# The menu bar item.
+pyobjc-core==13.0
+pyobjc-framework-Cocoa==13.0
