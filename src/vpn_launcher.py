@@ -167,6 +167,10 @@ assert find_update({"tag_name": "v9.0.0", "assets": [{"name": "x.exe", "browser_
                    "1.0.0", ".exe") is None
 
 
+class DownloadCancelled(Exception):
+    """Raised from the progress callback to stop a download the user cancelled."""
+
+
 def fetch(url, limit=200_000_000, progress=None):
     """Downloads a URL over HTTPS and returns the bytes; progress(done, total) is called as the data arrives."""
     request = urllib.request.Request(url, headers={"User-Agent": "vpn-launcher", "Accept": "application/vnd.github+json"})
@@ -1194,8 +1198,11 @@ def main():
     hint = ttk.Label(frame, text="" if profiles else "No profiles yet: add one to get started.",
                      foreground="gray", wraplength=360)
     hint.pack(anchor="w", pady=(0, 4))
-    # Shown under the hint line only while an update is being downloaded.
-    download_bar = ttk.Progressbar(frame, mode="determinate", maximum=100)
+    # Shown under the hint line only while an update is being downloaded: the progress and a way out.
+    download_row = ttk.Frame(frame)
+    download_bar = ttk.Progressbar(download_row, mode="determinate", maximum=100)
+    download_bar.pack(side="left", fill="x", expand=True)
+    ttk.Button(download_row, text="Cancel", command=lambda: app.update(cancel=True)).pack(side="right", padx=(10, 0))
     frame.bind("<Configure>", lambda event: hint.configure(wraplength=max(event.width - 32, 100)))
 
     def update_card(name):
@@ -1331,8 +1338,9 @@ def main():
         app["downloading"] = True  # a second click must not start a second download
         app["progress"] = (0, 0)
         hint.configure(text=f"Downloading version {update[0]}...")
+        app["cancel"] = False
         download_bar.configure(value=0)
-        download_bar.pack(fill="x", pady=(0, 8), after=hint)
+        download_row.pack(fill="x", pady=(0, 8), after=hint)
 
         def show_progress():
             # The download thread only stores the numbers; the label is updated here, on Tk's own thread.
@@ -1342,17 +1350,26 @@ def main():
                 download_bar.configure(value=done * 100 / total if total else 0)
                 root.after(100, show_progress)
 
+        def progress(done, total):
+            # Called by the download thread for every chunk: the place where a cancel request stops it.
+            if app["cancel"]:
+                raise DownloadCancelled()
+            app["progress"] = done, total
+
         def download():
             try:
-                return download_update(update, lambda done, total: app.__setitem__("progress", (done, total)))
-            except (OSError, ValueError, IndexError) as error:
+                return download_update(update, progress)
+            except (OSError, ValueError, IndexError, DownloadCancelled) as error:
                 return error
 
         root.after(300, show_progress)
 
         def downloaded(result):
             app["downloading"] = False
-            download_bar.pack_forget()
+            download_row.pack_forget()
+            if isinstance(result, DownloadCancelled):
+                hint.configure(text=f"The download of version {update[0]} was cancelled.")
+                return
             if isinstance(result, Exception):
                 hint.configure(text=f"The update could not be downloaded: {result}")
                 return
