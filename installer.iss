@@ -15,6 +15,11 @@ AppVersion={#AppVersion}
 DefaultDirName={autopf}\VPN Launcher
 DefaultGroupName=VPN Launcher
 DisableProgramGroupPage=yes
+; Always Program Files: a folder the user can write to would let another local user replace the program.
+DisableDirPage=yes
+; The program holds this mutex while it runs; Setup and the uninstaller ask to close it first.
+; It hides to the tray on a normal close request, so it cannot be closed automatically.
+AppMutex=VpnLauncherSingleInstance
 PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -33,6 +38,10 @@ Name: "opcli"; Description: "Install the 1Password CLI (only for profiles that t
 [Files]
 Source: "dist\VPN Launcher\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
 
+[InstallDelete]
+; An upgrade must not leave files of the previous build behind.
+Type: filesandordirs; Name: "{app}\_internal"
+
 [Icons]
 Name: "{group}\VPN Launcher"; Filename: "{app}\VPN Launcher.exe"
 Name: "{autodesktop}\VPN Launcher"; Filename: "{app}\VPN Launcher.exe"; Tasks: desktopicon
@@ -43,8 +52,8 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 ; Prerequisites come through winget, which ships with Windows 10 and 11.
-Filename: "{cmd}"; Parameters: "/c winget install --id OpenVPNTechnologies.OpenVPN -e --silent --accept-package-agreements --accept-source-agreements"; StatusMsg: "Installing the OpenVPN client..."; Flags: runhidden; Check: not OpenVpnInstalled
-Filename: "{cmd}"; Parameters: "/c winget install --id AgileBits.1Password.CLI -e --silent --accept-package-agreements --accept-source-agreements"; StatusMsg: "Installing the 1Password CLI..."; Flags: runhidden; Tasks: opcli
+Filename: "{cmd}"; Parameters: "/c winget install --id OpenVPNTechnologies.OpenVPN -e --source winget --silent --accept-package-agreements --accept-source-agreements"; StatusMsg: "Installing the OpenVPN client..."; Flags: runhidden; Check: not OpenVpnInstalled
+Filename: "{cmd}"; Parameters: "/c winget install --id AgileBits.1Password.CLI -e --source winget --silent --accept-package-agreements --accept-source-agreements"; StatusMsg: "Installing the 1Password CLI..."; Flags: runhidden; Tasks: opcli
 ; The OpenVPN interactive service takes free-form options only from Administrators and from this group.
 ; shortcut: {username} is the account that approved the elevation; when an administrator installs for a
 ; standard user, add that user to the group by hand.

@@ -1,4 +1,5 @@
-pywin32
-Pillow
-sv-ttk
-pyinstaller
+# Exact versions: the installer ships whatever is installed on the build machine.
+pywin32==311
+pillow==12.2.0
+sv_ttk==2.6.1
+pyinstaller==6.22.3

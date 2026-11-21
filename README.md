@@ -53,7 +53,11 @@ Security notes:
 - Two profiles that point at the same server with the same account cannot be up together.
 - An imported profile must carry its certificates inline; files it references are not copied.
 - Users without administrator rights must be members of the local `OpenVPN Administrators` group.
-  Setup adds the account that approved the elevation; add other accounts by hand.
+  Setup adds the account that approved the elevation; add other accounts by hand. Nothing is ever
+  started elevated: when the OpenVPN service refuses a connection, the launcher reports it and stops.
+- Scripts named in a profile (`up`, `down`, `route-up`, ...) are blocked: every connection runs with
+  `--script-security 1`. Importing a profile that uses such directives asks for confirmation first.
+- Only one instance runs at a time; starting it again brings the running window to the front.
 
 ## Development
 

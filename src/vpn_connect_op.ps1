@@ -4,9 +4,10 @@ Connects the OpenVPN community client using a profile, credentials and TOTP stor
 
 .DESCRIPTION
 Run from a NON-elevated shell: the 1Password CLI talks to the desktop app as the current user.
-openvpn.exe is started through the OpenVPN interactive service, without an elevation prompt; when the
-service cannot be used it is started elevated instead (one UAC prompt). The profile and credentials are
-written to a temp folder for the start of the connection and removed as soon as it is up or has failed.
+openvpn.exe is started through the OpenVPN interactive service, so it runs as the user and there is no
+elevation prompt; nothing here ever runs elevated. Scripts named in a profile are blocked. The profile and
+credentials are written to a temp folder for the start of the connection and removed as soon as it is up
+or has failed.
 
 Every connection has a name and its own folder, log and management port under
 %TEMP%\vpn_connect_op\<Name>, so several connections run side by side and are stopped one by one.
@@ -53,7 +54,10 @@ $work = Join-Path $env:TEMP "vpn_connect_op\$Name"
 $log = Join-Path $work "openvpn.log"
 $mgmtPw = Join-Path $work "mgmt.txt"    # random per-connection password of the management interface
 $portFile = Join-Path $work "port.txt"  # management port on 127.0.0.1, used for a graceful stop
-$pidFile = Join-Path $work "pid.txt"    # the elevated process hides its command line, so it is found by PID
+$pidFile = Join-Path $work "pid.txt"    # PID of the openvpn.exe of this connection
+
+# Native commands (op) print UTF-8; without this a non-ASCII password or user name arrives garbled.
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 
 function Read-OpSecret([string]$Ref) {
     $value = & op read $Ref
@@ -135,14 +139,10 @@ if ($Status -or $Disconnect) {
         $forced = -not (Stop-VpnGracefully)
         if ($forced) {
             # shortcut: the fallback force-kills the process and leaves its routes behind, they go away with the next graceful stop.
-            # A process started through the service is not elevated and can be stopped without a prompt.
+            # The process runs as the user (it was started through the service), so no elevation is involved.
             Stop-Process -Id $running.Id -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 1
-            if (Get-VpnProcess) {
-                Start-Process taskkill -Verb RunAs -WindowStyle Hidden -Wait -ArgumentList "/PID $($running.Id) /F"
-                Start-Sleep -Seconds 1
-            }
-            if (Get-VpnProcess) { throw "${Name}: openvpn.exe is still running." }
+            if (Get-VpnProcess) { throw "${Name}: openvpn.exe (PID $($running.Id)) could not be stopped. End it in Task Manager." }
         }
         Remove-Item $mgmtPw, $portFile, $pidFile -ErrorAction SilentlyContinue
         if ($forced) { "${Name}: disconnected (forced: the graceful stop was not available)." } else { "${Name}: disconnected." }
@@ -155,7 +155,8 @@ if ($Status -or $Disconnect) {
     $started = (Get-CimInstance Win32_Process -Filter "ProcessId=$($running.Id)").CreationDate
     [pscustomobject]@{
         Name   = $Name
-        State  = if ($text -match "Initialization Sequence Completed") { "Connected" } else { "Not established, see the log" }
+        # Only the part after the last restart counts: an older "Completed" says nothing about the tunnel now.
+        State  = if (($text -split "process restarting")[-1] -match "Initialization Sequence Completed") { "Connected" } else { "Not established, see the log" }
         # The process can exit between the two lookups; then there is no start time.
         Uptime = if ($started) { "{0:d\.hh\:mm\:ss}" -f ((Get-Date) - $started) } else { "unknown" }
         VpnIp  = if ($ip) { $ip.Groups[1].Value } else { "unknown" }
@@ -171,6 +172,7 @@ $fromOp = $PSCmdlet.ParameterSetName -eq "Connect"
 # The user's own profile file is used in place; only the copy fetched from 1Password is temporary.
 $cfg = if ($fromOp) { Join-Path $work "profile.ovpn" } else { (Resolve-Path $ProfilePath).Path }
 $creds = Join-Path $work "creds.txt"
+Remove-Item $creds -ErrorAction SilentlyContinue  # left behind if an earlier run was killed before its cleanup
 $state = "timeout"
 
 try {
@@ -214,14 +216,14 @@ try {
     [IO.File]::WriteAllText($portFile, "$port")
 
     # shortcut: dynamic challenge (CRV1) prompts are not handled, answer them over the management interface if the server uses them.
-    $options = "--config `"$cfg`" --auth-user-pass `"$creds`" --log `"$log`" --management 127.0.0.1 $port `"$mgmtPw`""
+    # --script-security 1 comes after --config and therefore wins: a profile cannot make OpenVPN run scripts.
+    $options = "--config `"$cfg`" --script-security 1 --auth-user-pass `"$creds`" --log `"$log`" --management 127.0.0.1 $port `"$mgmtPw`""
     try {
         $vpnPid = Start-VpnViaService $options
     }
     catch {
-        # No service, or this user may not pass options to it: start openvpn.exe elevated instead (one UAC prompt).
-        "${Name}: the OpenVPN service start is not available ($_), asking for elevation."
-        $vpnPid = (Start-Process $OpenVpn -Verb RunAs -WindowStyle Hidden -PassThru -ArgumentList $options).Id
+        # Deliberately no elevated fallback: it would run OpenVPN as administrator on a profile the user can edit.
+        throw "${Name}: the OpenVPN service did not start the connection ($_). Check that the service 'OpenVPNServiceInteractive' is running and that this account is an administrator or a member of the local group 'OpenVPN Administrators'."
     }
     [IO.File]::WriteAllText($pidFile, "$vpnPid")
     $proc = Get-Process -Id $vpnPid -ErrorAction SilentlyContinue
@@ -242,6 +244,11 @@ finally {
 
 if ($state -ne "connected") {
     Get-Content $log -Tail 20 -ErrorAction SilentlyContinue
+    # Do not leave OpenVPN retrying in the background with a one-time code that is already spent.
+    if (Get-VpnProcess) {
+        if (-not (Stop-VpnGracefully)) { Get-VpnProcess | Stop-Process -Force -ErrorAction SilentlyContinue }
+    }
+    Remove-Item $mgmtPw, $portFile, $pidFile -ErrorAction SilentlyContinue
     throw "${Name} is not connected: $state. Full log: $log"
 }
 "${Name}: connected. Check with -Status, stop with -Disconnect."

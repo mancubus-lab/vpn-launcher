@@ -31,6 +31,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import uuid
 import winreg
 from pathlib import Path
 from tkinter import filedialog, font as tkfont, messagebox, ttk
@@ -39,6 +40,7 @@ import sv_ttk
 import win32api
 import win32con
 import win32crypt
+import win32event
 import win32gui
 from PIL import Image, ImageDraw, ImageTk
 
@@ -120,6 +122,14 @@ def register_app_id():
 
 
 def run_script(*args, stdin_text=""):
+    """Runs the connect script; returns (exit code, output). Never raises: the caller's busy state depends on it."""
+    try:
+        return _run_script(*args, stdin_text=stdin_text)
+    except OSError as err:
+        return 1, f"PowerShell could not be started: {err}"
+
+
+def _run_script(*args, stdin_text):
     proc = subprocess.run(
         # Bypass: a fresh Windows blocks every script by default; this only covers our own bundled script.
         [PWSH, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", SCRIPT, *args],
@@ -140,8 +150,11 @@ def parse_status(process_running, log_text, uptime):
     """Returns (state, text) where state is one of the COLORS keys."""
     if not process_running:
         return "off", "Not connected"
-    if "Initialization Sequence Completed" not in log_text:
-        return "connecting", "Connecting..."
+    # Only what was logged after the last restart counts: an earlier "Completed" says nothing about the
+    # tunnel now, and showing "Connected" while OpenVPN is reconnecting would hide that traffic bypasses it.
+    restarted = "process restarting" in log_text
+    if "Initialization Sequence Completed" not in log_text.rsplit("process restarting", 1)[-1]:
+        return "connecting", "Reconnecting..." if restarted else "Connecting..."
     ips = re.findall(r"ifconfig (\d+\.\d+\.\d+\.\d+)", log_text)
     return "on", "  ·  ".join(["Connected", *ips[-1:], format_uptime(uptime)])
 
@@ -155,6 +168,9 @@ assert parse_status(False, "", 0) == ("off", "Not connected")
 assert parse_status(True, "", 0)[0] == "connecting"
 assert parse_status(True, "ifconfig 10.8.0.6 255.255.255.0\nInitialization Sequence Completed", 3900) == (
     "on", "Connected  ·  10.8.0.6  ·  1 h 05 min")
+assert parse_status(True, "Initialization Sequence Completed\nSIGUSR1[soft,ping-restart] received, process restarting",
+                    0) == ("connecting", "Reconnecting...")
+assert parse_status(True, "process restarting\nInitialization Sequence Completed", 0)[0] == "on"
 assert format_uptime(59) == "under a minute" and format_uptime(600) == "10 min"
 assert overall_state(["off", "on"]) == "on" and overall_state(["on", "connecting"]) == "connecting"
 assert overall_state([None, "off"]) == "off"
@@ -231,6 +247,35 @@ def check_profile(profile):
             raise ValueError(f"{name}: {key.replace('_', ' ')} is empty")
 
 
+# Profile directives that make OpenVPN run a program, load code or write a file of the profile's choosing.
+RISKY_DIRECTIVES = {
+    "up", "down", "route-up", "route-pre-down", "ipchange", "tls-verify", "auth-user-pass-verify",
+    "client-connect", "client-disconnect", "learn-address", "tls-crypt-v2-verify", "plugin",
+    "pkcs11-providers", "providers", "management", "status", "writepid", "log", "log-append",
+}
+
+
+def risky_directives(profile_text):
+    """Sorted names of the RISKY_DIRECTIVES an .ovpn uses; inline <ca>...</ca> style blocks are skipped."""
+    found, inside = set(), False
+    for line in profile_text.splitlines():
+        words = line.split()
+        if not words:
+            continue
+        if words[0].startswith("</"):
+            inside = False
+        elif words[0].startswith("<"):
+            inside = True
+        elif not inside and words[0].lower().lstrip("-") in RISKY_DIRECTIVES:
+            found.add(words[0].lower().lstrip("-"))
+    return sorted(found)
+
+
+assert risky_directives("client\nUP 'cmd /c x'\n<ca>\nplugin not-a-directive\n</ca>\n  plugin x.dll\n# up\n") == [
+    "plugin", "up"]
+assert risky_directives("client\nremote vpn.example 1194\nscript-security 2\n") == []
+
+
 def load_profiles():
     """Profiles from the JSON file; no file means a fresh install with nothing configured yet."""
     if not PROFILES.exists():
@@ -238,7 +283,8 @@ def load_profiles():
     profiles = json.loads(PROFILES.read_text(encoding="utf-8"))
     for profile in profiles:
         check_profile(profile)
-    if len({p["name"] for p in profiles}) != len(profiles):
+    # Compared without case: the name is a folder name, and Windows folders ignore case.
+    if len({p["name"].casefold() for p in profiles}) != len(profiles):
         raise ValueError("profile names must be unique")
     return profiles
 
@@ -486,7 +532,7 @@ def edit_profile(root, profile, taken):
 
     def describe(*_):
         path = Path(values["profile_path"].get() or "-")
-        shown.set("" if path.name == "-" else f"{path.name}  (imported, own copy)" if path.parent == PROFILE_DIR
+        shown.set("" if path.name == "-" else "Imported profile  (own copy)" if path.parent == PROFILE_DIR
                   else f"{path.name}  (will be copied on Save)")
 
     values["profile_path"].trace_add("write", describe)
@@ -517,7 +563,7 @@ def edit_profile(root, profile, taken):
                **{key: values[key].get().strip() for key in keys}}
         try:
             check_profile(new)
-            if new["name"] in taken:
+            if new["name"].casefold() in taken:
                 raise ValueError(f"{new['name']}: this name is already used")
             if source == "file":
                 if new_key.get().strip():
@@ -533,9 +579,19 @@ def edit_profile(root, profile, taken):
                 chosen = Path(new["profile_path"])
                 if not chosen.is_file():
                     raise ValueError("The profile file was not found")
-                if chosen.parent != PROFILE_DIR:  # import: keep an own copy next to the program
+                if chosen.parent != PROFILE_DIR:  # import: keep an own copy in the program's data folder
+                    risky = risky_directives(chosen.read_text(encoding="utf-8", errors="replace"))
+                    if risky:
+                        agreed = confirm(box, "This profile asks OpenVPN to run programs or write files:\n"
+                                              f"{', '.join(risky)}\n\n"
+                                              "Scripts are blocked on connect, so it may not work as intended.\n"
+                                              "Import it only if you trust where it came from. Import?")
+                        box.grab_set()  # the question took the modal grab; give it back to the editor
+                        if not agreed:
+                            return
                     PROFILE_DIR.mkdir(exist_ok=True)
-                    new["profile_path"] = str(PROFILE_DIR / f"{new['name']}.ovpn")
+                    # A random name: one derived from the profile name could overwrite another profile's copy.
+                    new["profile_path"] = str(PROFILE_DIR / f"{uuid.uuid4().hex}.ovpn")
                     shutil.copyfile(chosen, new["profile_path"])
         except (ValueError, OSError) as err:
             error.configure(text=str(err))
@@ -559,9 +615,32 @@ def edit_profile(root, profile, taken):
     return answer[0] if answer else None
 
 
+def first_instance():
+    """True when this process may run; otherwise it brings the running instance's window to the front.
+
+    Two instances would fight over the single OpenVPN management link and overwrite each other's files.
+    The mutex name is also the AppMutex of the installer, which uses it to see that the program is open.
+    """
+    global _instance_mutex  # kept for the life of the process: Windows frees it when the process ends
+    _instance_mutex = win32event.CreateMutex(None, True, "VpnLauncherSingleInstance")
+    if win32api.GetLastError() != 183:  # ERROR_ALREADY_EXISTS
+        return True
+    # After a self-restart the previous instance is still on its way out: wait for it to let go.
+    waited = win32event.WaitForSingleObject(_instance_mutex, 8000 if "--show" in sys.argv else 0)
+    if waited in (win32event.WAIT_OBJECT_0, win32event.WAIT_ABANDONED):
+        return True
+    try:  # same message as a left click on the tray icon
+        win32gui.PostMessage(win32gui.FindWindow("VpnLauncherTray", None), TRAY_MSG, 0, win32con.WM_LBUTTONUP)
+    except win32gui.error:
+        pass
+    return False
+
+
 def main():
     # Without this Windows bitmap-scales the window on a scaled display and it looks blurry.
     ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    if not first_instance():
+        return
     DATA.mkdir(parents=True, exist_ok=True)
     register_app_id()
     root = tk.Tk()
@@ -616,6 +695,8 @@ def main():
     journal_file.setFormatter(logging.Formatter("%(asctime)s  %(message)s"))
     journal.addHandler(journal_file)
     journal.info("VPN Launcher started")
+    # The installed build has no console: without this an error in a callback would vanish without a trace.
+    root.report_callback_exception = lambda *error: journal.error("Unexpected error", exc_info=error)
 
     def say(text, tag="", to_file=True):
         if tag:  # lines are marked with the connection they belong to
@@ -633,7 +714,8 @@ def main():
 
     def toggle(p):
         conn = conns[p["name"]]
-        if conn["busy"] or conn["vpn"] is None:
+        # grab_current: a dialog is open; the tray menu must not start a second action behind it.
+        if conn["busy"] or conn["vpn"] is None or root.grab_current():
             return
         if conn["vpn"] == "off" and p.get("source") == "file":
             if p.get("otp_key") and p.get("username"):
@@ -669,14 +751,22 @@ def main():
             start(p["name"], "Disconnecting...", "", ["-Disconnect"])
 
     def save_profiles(items):
-        PROFILES.write_text(json.dumps(items, indent=2, ensure_ascii=False), encoding="utf-8")
+        # Written to a side file and swapped in: a crash mid-write must not leave a truncated profile list.
+        draft = PROFILES.with_suffix(".tmp")
+        draft.write_text(json.dumps(items, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(draft, PROFILES)
 
     def edit(p):
         """Adds (p is None), changes or deletes a profile, then restarts the program to rebuild the cards."""
-        if p and (conns[p["name"]]["busy"] or conns[p["name"]]["vpn"] != "off"):
+        if root.grab_current():
+            return
+        if p and conns[p["name"]]["vpn"] != "off":
             hint.configure(text=f"Disconnect {p['name']} before changing it.")
             return
-        answer = edit_profile(root, p, {name for name in names if not p or name != p["name"]})
+        if any(conn["busy"] for conn in conns.values()):  # the restart after saving would orphan that action
+            hint.configure(text="Wait until the running connect or disconnect has finished.")
+            return
+        answer = edit_profile(root, p, {name.casefold() for name in names if not p or name != p["name"]})
         if not answer:
             return
         items = list(profiles)
@@ -684,14 +774,15 @@ def main():
             if not confirm(root, f"Delete profile {p['name']}?"):
                 return
             items.remove(p)
-            imported = Path(p.get("profile_path") or "-")
-            if imported.parent == PROFILE_DIR:  # the copy made on import holds keys: do not leave it behind
-                imported.unlink(missing_ok=True)
         elif p:
             items[items.index(p)] = answer[1]
         else:
             items.append(answer[1])
         save_profiles(items)
+        # The copy made on import holds keys: remove it once no profile points at it any more.
+        imported = Path((p or {}).get("profile_path") or "-")
+        if imported.parent == PROFILE_DIR and str(imported) not in {item.get("profile_path") for item in items}:
+            imported.unlink(missing_ok=True)
         restart()
 
     scale = root.winfo_fpixels("1i") / 96
@@ -795,14 +886,12 @@ def main():
         background(lambda: vpn_status(names), show_status)
 
     def refresh():
-        # "Auto" follows Windows live: the colours are taken at start-up, so a change restarts the program.
-        # Not while an action runs or a dialog is open, it is picked up on a later tick.
-        if (resolve_theme(settings["theme"]) != theme and not root.grab_current()
-                and not any(conn["busy"] for conn in conns.values())):
-            restart()
+        root.after(REFRESH_MS, refresh)  # first, so that an error below cannot stop the polling for good
+        # The colours are taken at start-up, so a theme change (in the settings, or in Windows with "Auto")
+        # restarts the program: now if nothing is going on, otherwise on a later tick.
+        if resolve_theme(settings["theme"]) != theme and not root.grab_current() and restart():
             return
         check_now()
-        root.after(REFRESH_MS, refresh)
 
     def finish(name, result):
         code, text = result
@@ -851,7 +940,7 @@ def main():
     def on_theme(event):
         settings["theme"] = THEMES[theme_choice.get()]
         SETTINGS.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-        restart()  # the hand-drawn parts take their colours at start-up
+        restart()  # if an action is running, refresh() does it once that has finished
 
     theme_row = ttk.Frame(box)
     theme_row.grid(row=len(CHECKBOXES) // 2, column=len(CHECKBOXES) % 2, sticky="w", pady=(2, 4))
@@ -872,15 +961,25 @@ def main():
         root.lift()
         root.focus_force()
 
+    def tray(*call):
+        """Shell_NotifyIcon that tolerates a missing icon: after an Explorer restart every call would raise."""
+        try:
+            win32gui.Shell_NotifyIcon(*call)
+        except win32gui.error:
+            pass
+
     def quit_app():
-        win32gui.Shell_NotifyIcon(win32gui.NIM_DELETE, (tray_hwnd, 0))
+        tray(win32gui.NIM_DELETE, (tray_hwnd, 0))
         root.destroy()
 
     def restart():
         # shortcut: a profile change restarts the program instead of rebuilding the cards, running VPNs are not touched.
-        win32gui.Shell_NotifyIcon(win32gui.NIM_DELETE, (tray_hwnd, 0))
+        if any(conn["busy"] for conn in conns.values()):
+            return False  # a connect or disconnect script is running: a restart would leave it without an owner
+        tray(win32gui.NIM_DELETE, (tray_hwnd, 0))
         subprocess.Popen([*SELF, "--show"], creationflags=NO_WINDOW)
         root.destroy()
+        return True
 
     def menu_items():
         """(text, action, enabled) rows; every connection has its own connect or disconnect row."""
@@ -928,15 +1027,15 @@ def main():
         return tray_hwnd, 0, flags, TRAY_MSG, icons[app["overall"] or "off"], f"VPN — {tip}"[:127]
 
     def update_tray():
-        win32gui.Shell_NotifyIcon(win32gui.NIM_MODIFY, tray_data())
+        tray(win32gui.NIM_MODIFY, tray_data())
 
     def notify(title, text, state):
         if settings["notify"]:
-            win32gui.Shell_NotifyIcon(win32gui.NIM_MODIFY, (
+            tray(win32gui.NIM_MODIFY, (
                 tray_hwnd, 0, win32gui.NIF_INFO | win32gui.NIF_ICON, TRAY_MSG, big_icons[state], "",
                 text[:255], 10, title, NIIF_USER_LARGE))
 
-    win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, tray_data())
+    tray(win32gui.NIM_ADD, tray_data())
     root.protocol("WM_DELETE_WINDOW", lambda: root.withdraw() if settings["close_to_tray"] else quit_app())
     if settings["start_minimized"] and "--show" not in sys.argv:  # --show: restarted after a profile change
         root.withdraw()
