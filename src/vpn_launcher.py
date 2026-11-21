@@ -374,6 +374,19 @@ def resolve_theme(choice):
 assert resolve_theme("dark") == "dark" and resolve_theme("auto") in ("light", "dark")
 
 
+def on_screen(geometry):
+    """True when the top-left corner of a saved "WxH+X+Y" lies on the current desktop (all monitors)."""
+    found = re.fullmatch(r"\d+x\d+\+(-?\d+)\+(-?\d+)", geometry or "")
+    if not found:
+        return False
+    left, top, width, height = (ctypes.windll.user32.GetSystemMetrics(index) for index in (76, 77, 78, 79))
+    x, y = int(found.group(1)), int(found.group(2))
+    return left <= x < left + width - 100 and top <= y < top + height - 100
+
+
+assert not on_screen("") and not on_screen("800x600+999999+0") and not on_screen("garbage")
+
+
 def set_autostart(enabled):
     command = subprocess.list2cmdline(SELF)
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
@@ -419,6 +432,7 @@ def show_modal(root, box, focus):
     else:  # asked from the tray menu while the main window is hidden
         x, y = (box.winfo_screenwidth() - width) // 2, (box.winfo_screenheight() - height) // 2
     box.geometry(f"+{x}+{y}")
+    box.deiconify()
     box.lift()
     box.grab_set()
     focus.focus_force()
@@ -435,6 +449,7 @@ def match_title_bar(window):
 
 def new_dialog(root):
     box = tk.Toplevel(root)
+    box.withdraw()  # hidden until show_modal has placed it; otherwise it flashes at a default spot first
     box.title("VPN Launcher")
     box.configure(bg=ttk.Style().lookup("TFrame", "background"))  # a Toplevel does not follow the ttk theme
     match_title_bar(box)
@@ -887,6 +902,10 @@ def main():
 
     def refresh():
         root.after(REFRESH_MS, refresh)  # first, so that an error below cannot stop the polling for good
+        # The window's place and size are remembered as they change, so even a reboot does not lose them.
+        if root.state() == "normal" and root.geometry() != settings.get("geometry"):
+            settings["geometry"] = root.geometry()
+            SETTINGS.write_text(json.dumps(settings, indent=2), encoding="utf-8")
         # The colours are taken at start-up, so a theme change (in the settings, or in Windows with "Auto")
         # restarts the program: now if nothing is going on, otherwise on a later tick.
         if resolve_theme(settings["theme"]) != theme and not root.grab_current() and restart():
@@ -953,6 +972,8 @@ def main():
     root.minsize(root.winfo_reqwidth(), root.winfo_reqheight())  # never smaller than the controls
     if settings["show_log"]:
         log_box.pack(fill="both", expand=True, pady=(12, 0))
+    if on_screen(settings.get("geometry")):  # not when that monitor is gone
+        root.geometry(settings["geometry"])
 
     # Tray icon: gray, orange or green padlock by state. Tk's event loop also pumps this window.
     # shortcut: the icon is not re-added after an Explorer restart, handle TaskbarCreated if that matters.
