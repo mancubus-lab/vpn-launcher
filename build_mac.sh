@@ -18,7 +18,7 @@ cd "$(dirname "$0")"
 python="${PYTHON:-python3}"
 
 # The brand's tool icon; PyInstaller turns the PNG into an .icns with Pillow.
-icon="assets/app-1024.png"
+icon="$PWD/assets/app-1024.png"  # absolute: PyInstaller resolves relative paths against --specpath
 
 # The program reads its version from this file (About window, update check).
 mkdir -p build
