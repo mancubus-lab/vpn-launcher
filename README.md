@@ -165,7 +165,7 @@ On macOS use `requirements-mac.txt` and `python src/vpn_launcher.py`.
 | `build_mac.sh` | macOS: builds the app bundle and the disk image |
 | `installer.iss` | Inno Setup script |
 | `tests/smoke_profiles.py` | Sample profiles for the smoke run of the build pipeline |
-| `assets/` | Application icon and screenshots |
+| `assets/` | App icon and the tray icons per state (from mancubus-lab-brand-assets), the lab logo, screenshots |
 | `.github/` | Release workflow and the release description template |
 
 `vpn_launcher.py` checks its pure functions with assertions at import time; a failed check stops the start.

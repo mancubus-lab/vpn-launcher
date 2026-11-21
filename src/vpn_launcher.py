@@ -78,7 +78,6 @@ SETTINGS = DATA / "vpn_launcher_settings.json"
 WORK = Path(os.environ["TEMP"]) / "vpn_connect_op" if WINDOWS else vpn_mac.WORK
 JOURNAL = WORK / "launcher.log"  # copy of the window's journal for later troubleshooting
 JOURNAL_BYTES = 1_000_000  # per file; one older file (launcher.log.1) is kept, so at most twice this on disk
-ICONS = DATA / "vpn_launcher_icons"  # generated on first use
 PWSH = shutil.which("pwsh") or "powershell"
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if WINDOWS else 0
 REFRESH_MS = 2000
@@ -259,10 +258,22 @@ def download_update(update, progress=None):
 
 
 def icon_path(state):
-    """Draws a white padlock on a rounded square in the state colour; the .ico is cached in ICONS."""
-    path = ICONS / f"lock_{state}.ico"
+    """The tray icon (.ico) of a connection state; the .png beside it is used for the macOS menu bar.
+
+    The icons come from mancubus-lab-brand-assets (tool-vpn-launcher-tray-*): the lab's tool template with a
+    padlock whose colour is the state. Copied into assets/icons; rebuild them there, not here.
+    """
+    return resource(f"icons/{state}.ico")
+
+
+def lock_path(state):
+    """The plain padlock in the state colour, for the cards and the window: .ico, with a .png beside it.
+
+    Drawn on first use and cached in the data folder. The brand logo is kept for the tray and the header.
+    """
+    path = DATA / "vpn_launcher_icons" / f"lock_{state}.ico"
     if not path.with_suffix(".png").exists():
-        ICONS.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         color = COLORS[state]
         image = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
@@ -274,7 +285,7 @@ def icon_path(state):
         draw.ellipse((114, 140, 142, 168), fill=color)  # keyhole
         draw.rectangle((122, 160, 134, 190), fill=color)
         image.save(path, sizes=[(s, s) for s in (16, 20, 24, 32, 40, 48, 64)])
-        image.save(path.with_suffix(".png"))  # full-size master for the picture inside the window
+        image.save(path.with_suffix(".png"))
     return path
 
 
@@ -287,7 +298,7 @@ def register_app_id():
     """Makes Windows label notifications "VPN Launcher" instead of "Python"."""
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, rf"Software\Classes\AppUserModelId\{APP_ID}") as key:
         winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, "VPN Launcher")
-        winreg.SetValueEx(key, "IconUri", 0, winreg.REG_SZ, str(icon_path("on")))
+        winreg.SetValueEx(key, "IconUri", 0, winreg.REG_SZ, str(resource("app.ico")))
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
 
 
@@ -699,7 +710,7 @@ def match_title_bar(window):
 def set_window_icon(window, state):
     """Title bar and taskbar icon. macOS windows have none: the Dock icon comes from the app bundle."""
     if WINDOWS:
-        window.iconbitmap(icon_path(state))
+        window.iconbitmap(lock_path(state))
 
 
 def display_scale(root):
@@ -1055,9 +1066,9 @@ def main():
 
     frame = ttk.Frame(root, padding=16)
     frame.pack(fill="both", expand=True)
-    # The same padlock as in the tray and the title bar, sized for the display scale.
+    # The same padlock as in the title bar, sized for the display scale.
     side = round(36 * display_scale(root))
-    pictures = {name: ImageTk.PhotoImage(Image.open(icon_path(name).with_suffix(".png")).resize((side, side)))
+    pictures = {name: ImageTk.PhotoImage(Image.open(lock_path(name).with_suffix(".png")).resize((side, side)))
                 for name in COLORS}
 
     log_box = tk.Frame(frame, bg=ui["card"], highlightthickness=1, highlightbackground=ui["border"])

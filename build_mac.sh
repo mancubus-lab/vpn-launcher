@@ -17,8 +17,8 @@ fi
 cd "$(dirname "$0")"
 python="${PYTHON:-python3}"
 
-# The program draws its own icon; PyInstaller turns the PNG into an .icns with Pillow.
-icon="$("$python" -c "import sys; sys.path.insert(0, 'src'); import vpn_launcher; print(vpn_launcher.icon_path('on').with_suffix('.png'))")"
+# The brand's tool icon; PyInstaller turns the PNG into an .icns with Pillow.
+icon="assets/app-1024.png"
 
 # The program reads its version from this file (About window, update check).
 mkdir -p build
@@ -27,6 +27,7 @@ printf '%s' "$version" > build/version.txt
 "$python" -m PyInstaller --noconfirm --clean --windowed --name "VPN Launcher" --icon "$icon" \
     --osx-bundle-identifier co.mancubus.vpnlauncher --collect-data sv_ttk \
     --add-data "$PWD/build/version.txt:." --add-data "$PWD/assets/mancubus-lab.png:." \
+    --add-data "$PWD/assets/app.ico:." --add-data "$PWD/assets/icons:icons" \
     --distpath dist --workpath build --specpath build src/vpn_launcher.py
 
 dmg="dist/VpnLauncher-$version-$(uname -m).dmg"

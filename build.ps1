@@ -26,7 +26,7 @@ $ErrorActionPreference = "Stop"
 $here = $PSScriptRoot
 $source = "$here\src\vpn_launcher.py"
 $script = "$here\src\vpn_connect_op.ps1"
-$icon = "$here\assets\lock_on.ico"
+$icon = "$here\assets\app.ico"  # from mancubus-lab-brand-assets: tool-vpn-launcher.ico
 
 foreach ($path in $Python, $source, $script, $icon) {
     if (-not (Test-Path $path)) { throw "Missing: $path" }
@@ -38,6 +38,7 @@ New-Item -ItemType Directory -Force "$here\build" | Out-Null
 
 & $Python -m PyInstaller --noconfirm --clean --windowed --name "VPN Launcher" --icon $icon `
     --add-data "$script;." --add-data "$here\build\version.txt;." --add-data "$here\assets\mancubus-lab.png;." `
+    --add-data "$here\assets\app.ico;." --add-data "$here\assets\icons;icons" `
     --collect-data sv_ttk `
     --distpath "$here\dist" --workpath "$here\build" --specpath "$here\build" $source
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed." }
