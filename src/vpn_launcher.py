@@ -867,7 +867,8 @@ def main():
         button.grid(row=0, column=3, rowspan=3, padx=(16, 0))
         edit_button = ttk.Button(card, text="Edit", width=5, command=lambda p=p: edit(p))
         edit_button.grid(row=0, column=4, rowspan=3, padx=(8, 0))
-        flow = tk.Label(card, text="", bg=ui["card"], fg=ui["muted"], font=("Segoe UI", 9))
+        # A fixed width: otherwise every change in the length of the numbers would resize the whole window.
+        flow = tk.Label(card, text="", bg=ui["card"], fg=ui["muted"], font=("Segoe UI", 9), width=52, anchor="w")
         flow.grid(row=2, column=1, sticky="w")
         graph = tk.Canvas(card, width=graph_size[0], height=graph_size[1], bg=ui["card"], highlightthickness=0)
         graph.grid(row=0, column=2, rowspan=3, padx=(16, 0))
