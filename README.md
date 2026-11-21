@@ -38,6 +38,7 @@
 
 - 🔌 **One card per connection** — state, VPN address, uptime, live traffic speed and a two-minute graph.
 - 🧩 **Several VPNs at once** — each one is connected and disconnected on its own.
+- ↕️ **Arrange and rename in place** — drag a card to reorder the list, double-click a name to change it.
 - 🔑 **Three ways to authenticate**, chosen per profile:
   - **1Password** – the `.ovpn` profile, the user name, the password and the one-time code are
     read with the 1Password CLI at connect time; nothing is stored by the launcher.

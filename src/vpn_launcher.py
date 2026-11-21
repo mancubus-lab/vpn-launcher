@@ -1065,7 +1065,7 @@ def main():
     for p in profiles:
         # The outer frame is the card's border and holds a stripe in the state colour along the left edge.
         shell = tk.Frame(frame, bg=ui["card"], highlightthickness=1, highlightbackground=ui["border"])
-        shell.pack(fill="x", pady=(0, 10))
+        shell.pack(fill="x", pady=(0, 10))  # drag_move() re-packs the cards with the same options
         stripe = tk.Frame(shell, bg=COLORS["off"], width=max(round(5 * display_scale(root)), 3))
         stripe.pack(side="left", fill="y")
         card = tk.Frame(shell, bg=ui["card"], padx=14, pady=12)
@@ -1073,7 +1073,9 @@ def main():
         card.columnconfigure(1, weight=1)
         lamp = tk.Label(card, image=pictures["off"], bg=ui["card"])
         lamp.grid(row=0, column=0, rowspan=3, padx=(0, 14))
-        tk.Label(card, text=p["name"], bg=ui["card"], fg=ui["text"], font=("Segoe UI Semibold", 13)).grid(row=0, column=1, sticky="w")
+        title = tk.Label(card, text=p["name"], bg=ui["card"], fg=ui["text"], font=("Segoe UI Semibold", 13))
+        title.grid(row=0, column=1, sticky="w")
+        title.bind("<Double-Button-1>", lambda event, p=p: rename(p))
         line = tk.Label(card, text="Checking...", bg=ui["card"], fg=COLORS["off"], font=("Segoe UI", 10))
         line.grid(row=1, column=1, sticky="w")
         button = ttk.Button(card, text="Connect", width=13, command=lambda p=p: toggle(p))
@@ -1093,9 +1095,84 @@ def main():
             flow.append(cell)
         graph = tk.Canvas(card, width=graph_size[0], height=graph_size[1], bg=ui["card"], highlightthickness=0)
         graph.grid(row=0, column=2, rowspan=3, padx=(16, 0))
-        cards[p["name"]] = lamp, line, button, flow, graph, edit_button, stripe
+        cards[p["name"]] = lamp, line, button, flow, graph, edit_button, stripe, shell, title
+        # The card is dragged by any of its passive parts; the buttons keep their own clicks.
+        for handle in (card, lamp, title, line, table, graph, stripe, *flow):
+            handle.bind("<ButtonPress-1>", lambda event, p=p: drag.update(profile=p, start=event.y_root, moved=False))
+            handle.bind("<B1-Motion>", lambda event: drag_move(event.y_root))
+            handle.bind("<ButtonRelease-1>", lambda event: drag_end())
 
-    ttk.Button(frame, text="+  Add profile", command=lambda: edit(None)).pack(anchor="w", pady=(0, 6))
+    add_button = ttk.Button(frame, text="+  Add profile", command=lambda: edit(None))
+    add_button.pack(anchor="w", pady=(0, 6))
+
+    # Reordering by drag and drop: the order is only how the cards are listed, so it is allowed at any time.
+    drag = {"profile": None, "start": 0, "moved": False}
+
+    def drag_move(pointer_y):
+        p = drag["profile"]
+        if not p or (not drag["moved"] and abs(pointer_y - drag["start"]) < 8):
+            return  # a click with a slightly shaky hand is not a drag
+        if not drag["moved"]:
+            drag["moved"] = True
+            root.configure(cursor="fleur")
+        # The card goes to the position of the card whose middle the pointer has passed.
+        others = [q for q in profiles if q is not p]
+        position = sum(pointer_y > cards[q["name"]][7].winfo_rooty() + cards[q["name"]][7].winfo_height() / 2
+                       for q in others)
+        if profiles.index(p) != position:
+            profiles.remove(p)
+            profiles.insert(position, p)
+            for q in profiles:
+                cards[q["name"]][7].pack_forget()
+            for q in profiles:
+                cards[q["name"]][7].pack(fill="x", pady=(0, 10), before=add_button)
+
+    def drag_end():
+        if drag["moved"]:
+            root.configure(cursor="")
+            save_profiles(profiles)
+        drag.update(profile=None, moved=False)
+
+    def rename(p):
+        """Double click on the name: edit it in place. Enter keeps the new name, Escape gives up."""
+        old = p["name"]
+        if root.grab_current() or drag["moved"]:
+            return
+        if conns[old]["busy"] or conns[old]["vpn"] != "off":
+            hint.configure(text=f"Disconnect {old} before renaming it.")
+            return
+        title = cards[old][8]
+        text = tk.StringVar(value=old)
+        entry = ttk.Entry(title.master, textvariable=text, font=("Segoe UI Semibold", 12), width=24)
+        entry.grid(row=0, column=1, sticky="w")
+        entry.select_range(0, "end")
+        entry.focus_set()
+
+        def keep(event=None):
+            new = text.get().strip()
+            if new == old:
+                entry.destroy()
+                return
+            try:
+                check_profile({**p, "name": new})
+                if new.casefold() in {name.casefold() for name in names if name != old}:
+                    raise ValueError(f"{new}: this name is already used")
+            except ValueError as error:
+                hint.configure(text=str(error))
+                return
+            # The name is the key of everything kept per connection; the buttons read it from p when pressed.
+            p["name"] = new
+            names[names.index(old)] = new
+            conns[new] = conns.pop(old)
+            cards[new] = cards.pop(old)
+            title.configure(text=new)
+            save_profiles(profiles)
+            hint.configure(text="")
+            entry.destroy()
+
+        entry.bind("<Return>", keep)
+        entry.bind("<Escape>", lambda event: entry.destroy())
+        entry.bind("<FocusOut>", lambda event: entry.destroy())
 
     def draw_graph(name):
         """Download (green area) and upload (blue line) speed of the last two minutes, scaled to the highest value."""
@@ -1136,6 +1213,8 @@ def main():
 
     def show_status(result):
         for name, (new, text, log_text) in result.items():
+            if name not in conns:
+                continue  # renamed while this check was running; the next one uses the new name
             conn = conns[name]
             previous, conn["vpn"] = conn["vpn"], new
             if log_text != conn["log"]:
