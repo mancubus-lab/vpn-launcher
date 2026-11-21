@@ -1117,6 +1117,8 @@ def main():
     hint = ttk.Label(frame, text="" if profiles else "No profiles yet: add one to get started.",
                      foreground="gray", wraplength=360)
     hint.pack(anchor="w", pady=(0, 4))
+    # Shown under the hint line only while an update is being downloaded.
+    download_bar = ttk.Progressbar(frame, mode="determinate", maximum=100)
     frame.bind("<Configure>", lambda event: hint.configure(wraplength=max(event.width - 32, 100)))
 
     def update_card(name):
@@ -1250,12 +1252,16 @@ def main():
         app["downloading"] = True  # a second click must not start a second download
         app["progress"] = (0, 0)
         hint.configure(text=f"Downloading version {update[0]}...")
+        download_bar.configure(value=0)
+        download_bar.pack(fill="x", pady=(0, 8), after=hint)
 
         def show_progress():
             # The download thread only stores the numbers; the label is updated here, on Tk's own thread.
             if app["downloading"]:
-                hint.configure(text=f"Downloading version {update[0]}: {progress_text(*app['progress'])}")
-                root.after(300, show_progress)
+                done, total = app["progress"]
+                hint.configure(text=f"Downloading version {update[0]}: {progress_text(done, total)}")
+                download_bar.configure(value=done * 100 / total if total else 0)
+                root.after(100, show_progress)
 
         def download():
             try:
@@ -1267,6 +1273,7 @@ def main():
 
         def downloaded(result):
             app["downloading"] = False
+            download_bar.pack_forget()
             if isinstance(result, Exception):
                 hint.configure(text=f"The update could not be downloaded: {result}")
                 return
@@ -1442,6 +1449,12 @@ def main():
         root.report_callback_exception = lambda *error: (journal.error("Smoke test", exc_info=error), os._exit(1))
         root.after(5000, quit_app)
 
+    # Installers of earlier updates have done their job: do not let them pile up in the temp folder.
+    for leftover in (WORK / "update").glob("*"):
+        try:
+            leftover.unlink()
+        except OSError:
+            pass  # still in use by an installer that is finishing
     root.after(4000, automatic_update_check)
     refresh()
     root.mainloop()
