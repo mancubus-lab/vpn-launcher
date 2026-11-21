@@ -576,8 +576,12 @@ def show_modal(root, box, focus):
         y = root.winfo_y() + (root.winfo_height() - height) // 2
     else:  # asked from the tray menu while the main window is hidden
         x, y = (box.winfo_screenwidth() - width) // 2, (box.winfo_screenheight() - height) // 2
-    box.geometry(f"+{x}+{y}")
+    # The title bar can be coloured only once Windows has created the real window, which happens when it
+    # is first shown. So it is first shown far off the screen, coloured there, and then moved into place.
+    box.geometry("+-20000+-20000")
     box.deiconify()
+    match_title_bar(box)
+    box.geometry(f"+{x}+{y}")
     box.lift()
     box.grab_set()
     focus.focus_force()
@@ -610,7 +614,6 @@ def new_dialog(root):
     box.withdraw()  # hidden until show_modal has placed it; otherwise it flashes at a default spot first
     box.title("VPN Launcher")
     box.configure(bg=ttk.Style().lookup("TFrame", "background"))  # a Toplevel does not follow the ttk theme
-    match_title_bar(box)
     box.resizable(False, False)
     set_window_icon(box, "on")
     return box
@@ -891,7 +894,7 @@ def main():
     if WINDOWS:
         register_app_id()
     root = tk.Tk()
-    root.title("VPN Launcher")
+    root.title(f"VPN Launcher {VERSION}")
     set_window_icon(root, "off")
     settings = load_settings()
     theme = resolve_theme(settings["theme"])
@@ -1218,6 +1221,8 @@ def main():
                 app["update_button"] = pill_button(header, f"Update to {found[0]}", install_update, primary=True)
                 app["update_button"].pack(side="right", padx=(0, 10))
             app["update"] = found
+            if app.get("downloading"):
+                return  # the hint line is showing the download progress: leave it alone
             if found:
                 if asked:
                     hint.configure(text=f"Version {found[0]} is available: press the update button at the top.")

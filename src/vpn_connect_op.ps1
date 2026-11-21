@@ -170,7 +170,8 @@ if ($running) { throw "${Name} is already running. Run with -Disconnect first." 
 New-Item -ItemType Directory -Force $work | Out-Null
 $fromOp = $PSCmdlet.ParameterSetName -eq "Connect"
 # OpenVPN always gets a temporary copy in the work folder, fetched from 1Password or copied from the user's
-# file: started through the service it exits at once on a profile under %APPDATA%, while one here works.
+# file. The service starts OpenVPN outside this process's environment, so it must not depend on a path that
+# only this process can see (a packaged parent app, for example, gets a private view of %APPDATA%).
 $cfg = Join-Path $work "profile.ovpn"
 $creds = Join-Path $work "creds.txt"
 Remove-Item $creds -ErrorAction SilentlyContinue  # left behind if an earlier run was killed before its cleanup
