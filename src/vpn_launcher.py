@@ -96,6 +96,12 @@ UPLOAD = "#3b7dd8"
 BRAND = {"bg": "#15171a", "ink": "#ffffff", "muted": "#b9c0c9", "accent": "#ff681c"}
 WEBSITE = "https://mancubus-lab.com/"
 REPOSITORY = "mancubus-lab/vpn-launcher"  # releases of this repository are the update channel
+# The site serves the same release files from Cloudflare: GitHub's file servers can be very slow on some
+# networks. GitHub itself stays as the fallback when the site cannot be reached.
+UPDATE_SOURCES = [
+    ("https://mancubus-lab.com/vpn-launcher/latest.json", "https://mancubus-lab.com/vpn-launcher/download/"),
+    (f"https://api.github.com/repos/{REPOSITORY}/releases/latest", f"https://github.com/{REPOSITORY}/releases/download/"),
+]
 UPDATE_CHECK_MS = 6 * 60 * 60 * 1000
 NIIF_USER_LARGE = 0x4 | 0x20  # NIIF_USER | NIIF_LARGE_ICON: the notification shows our icon, not the blue "i"
 # Setting key, checkbox label, default value.
@@ -137,16 +143,15 @@ def parse_version(text):
     return tuple(int(part) for part in found.groups()) if found else None
 
 
-def find_update(release, current, suffix):
-    """(version, installer URL, checksum URL) when a GitHub release is newer than the running version.
+def find_update(release, current, suffix, prefix=f"https://github.com/{REPOSITORY}/releases/download/"):
+    """(version, installer URL, checksum URL) when a release is newer than the running version.
 
-    suffix picks the download for this system. Only files of our own repository's releases are accepted,
-    and only together with their .sha256 file.
+    suffix picks the download for this system. Only links under prefix (the source the release came from)
+    are accepted, and only an installer together with its .sha256 file.
     """
     latest, running = parse_version(str(release.get("tag_name", ""))), parse_version(current)
     if not latest or not running or latest <= running:
         return None
-    prefix = f"https://github.com/{REPOSITORY}/releases/download/"
     links = {asset.get("name", ""): asset.get("browser_download_url", "") for asset in release.get("assets", [])}
     links = {name: link for name, link in links.items() if link.startswith(prefix)}
     installer = next((name for name in links if name.endswith(suffix)), None)
@@ -165,6 +170,11 @@ assert find_update(_sample_release, "1.0.0", ".dmg") is None  # no checksum file
 assert find_update({"tag_name": "v9.0.0", "assets": [{"name": "x.exe", "browser_download_url": "https://evil/x.exe"},
                                                      {"name": "x.exe.sha256", "browser_download_url": "https://evil/s"}]},
                    "1.0.0", ".exe") is None
+_site = "https://mancubus-lab.com/vpn-launcher/download/"
+_site_release = {"tag_name": "v1.2.0", "assets": [{"name": name, "browser_download_url": f"{_site}v1.2.0/{name}"}
+                                                  for name in ("Setup-1.2.0.exe", "Setup-1.2.0.exe.sha256")]}
+assert find_update(_site_release, "1.1.0", ".exe", _site)[1] == f"{_site}v1.2.0/Setup-1.2.0.exe"
+assert find_update(_site_release, "1.1.0", ".exe") is None  # site links are not accepted as GitHub ones
 
 
 class DownloadCancelled(Exception):
@@ -196,12 +206,20 @@ def progress_text(done, total):
 
 
 def check_update():
-    """The newer release for this system as find_update() describes it, or None (also when offline)."""
-    try:
-        release = json.loads(fetch(f"https://api.github.com/repos/{REPOSITORY}/releases/latest"))
-        return find_update(release, VERSION, ".exe" if WINDOWS else "-arm64.dmg")
-    except (OSError, ValueError, AttributeError):
-        return None
+    """The newer release for this system as find_update() describes it, or None (also when offline).
+
+    The first source that answers decides; the downloads then come from that same source.
+    """
+    for info_url, prefix in UPDATE_SOURCES:
+        try:
+            release = json.loads(fetch(info_url))
+        except (OSError, ValueError):
+            continue  # unreachable or not JSON: try the next source
+        try:
+            return find_update(release, VERSION, ".exe" if WINDOWS else "-arm64.dmg", prefix)
+        except (AttributeError, TypeError):
+            return None
+    return None
 
 
 def download_update(update, progress=None):
