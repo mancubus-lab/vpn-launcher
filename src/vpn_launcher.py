@@ -116,8 +116,19 @@ def resource(name):
     return bundled if bundled.exists() else RESOURCES.parent / "assets" / name
 
 
-# The build writes the release version into version.txt; a checkout has none and never offers updates.
-VERSION = resource("version.txt").read_text().strip() if resource("version.txt").exists() else "dev"
+def source_version():
+    """Version of a copy run from a checkout: the latest release tag plus "-dev", or just "dev" without git."""
+    try:
+        tag = subprocess.run(["git", "-C", str(RESOURCES.parent), "describe", "--tags", "--abbrev=0"],
+                             capture_output=True, text=True, timeout=5, creationflags=NO_WINDOW).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        tag = ""
+    return f"{tag.lstrip('v')}-dev" if tag else "dev"
+
+
+# The build writes the release version into version.txt. A checkout has none: it shows the tag it is based on
+# with "-dev", which is not a release version, so such a copy never offers updates.
+VERSION = resource("version.txt").read_text().strip() if resource("version.txt").exists() else source_version()
 
 
 def parse_version(text):
@@ -920,7 +931,11 @@ def main():
         mark = None  # the logo file is missing: the header shows the text alone
     titles = tk.Frame(header, bg=BRAND["bg"])
     titles.pack(side="left")
-    tk.Label(titles, text="VPN Launcher", bg=BRAND["bg"], fg=BRAND["ink"], font=("Segoe UI Semibold", 14)).pack(anchor="w")
+    title_row = tk.Frame(titles, bg=BRAND["bg"])
+    title_row.pack(anchor="w")
+    tk.Label(title_row, text="VPN Launcher", bg=BRAND["bg"], fg=BRAND["ink"], font=("Segoe UI Semibold", 14)).pack(side="left")
+    tk.Label(title_row, text=f"v{VERSION}", bg=BRAND["bg"], fg=BRAND["muted"], font=("Segoe UI", 9)).pack(
+        side="left", padx=(8, 0), anchor="s", pady=(0, 3))
     summary = tk.Label(titles, text="Checking...", bg=BRAND["bg"], fg=BRAND["muted"], font=("Segoe UI", 9))
     summary.pack(anchor="w")
     pill_button(header, "About", lambda: about()).pack(side="right")
@@ -1207,7 +1222,7 @@ def main():
                 if asked:
                     hint.configure(text=f"Version {found[0]} is available: press the update button at the top.")
             elif asked:
-                hint.configure(text="This is a development copy, it does not update itself." if VERSION == "dev"
+                hint.configure(text="This is a development copy, it does not update itself." if not parse_version(VERSION)
                                else f"Version {VERSION} is the latest one, or the update server cannot be reached.")
         background(check_update, shown)
 
