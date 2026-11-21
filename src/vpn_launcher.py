@@ -84,17 +84,54 @@ REFRESH_MS = 2000
 TRAY_MSG = 0x0400 + 20  # WM_USER + 20: our private message from the tray icon
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 APP_ID = "VpnLauncher"
-COLORS = {"off": "#7a7a7a", "connecting": "#e08a00", "on": "#2e9e44"}
+UPLOAD = "#3b7dd8"  # the upload line of the traffic graph; a chart series colour, not part of the brand tokens
+
+
+def _mix(color, other, amount):
+    """The hex colour `amount` (0..1) of the way from color to other."""
+    a, b = (tuple(int(c[i:i + 2], 16) for i in (1, 3, 5)) for c in (color, other))
+    return "#" + "".join(f"{round(x + (y - x) * amount):02x}" for x, y in zip(a, b))
+
+
+def _solid(color, under):
+    """Tk has no transparency: an rgba() token becomes the opaque colour it shows over `under`."""
+    found = re.fullmatch(r"rgba\((\d+),\s*(\d+),\s*(\d+),\s*([\d.]+)\)", color.strip())
+    if not found:
+        return color.lower()
+    r, g, b = (int(found.group(i)) for i in (1, 2, 3))
+    return _mix(under, f"#{r:02x}{g:02x}{b:02x}", float(found.group(4)))
+
+
+mix = _mix
+assert mix("#000000", "#ffffff", 0.5) == "#808080" and _solid("rgba(255, 255, 255, 0.5)", "#000000") == "#808080"
+
+# All colours come from the Mancubus Lab brand tokens: assets/tokens.json, a copy of tokens/tokens.json from
+# mancubus-lab-brand-assets. Change them there and copy the file here. Read straight from the bundle folder or
+# assets/, because resource() is defined further down.
+_TOKENS_FILE = next(p for p in (RESOURCES / "tokens.json", RESOURCES.parent / "assets" / "tokens.json") if p.exists())
+TOKENS = json.loads(_TOKENS_FILE.read_text(encoding="utf-8"))
+_brand, _dark = TOKENS["brand"], TOKENS["themes"]["dark"]
+STATE_TOKENS = {"off": "ink-soft", "connecting": "warning", "on": "success"}  # the token of each connection state
+# The coloured padlock squares: the same in both themes, matching the tray, where connecting is orange.
+COLORS = {"off": _dark["ink-soft"], "connecting": _brand["orange"], "on": _dark["success"]}
 # Colours of the hand-drawn parts (cards, graph, log) per theme; "fill" is the tint under the download line.
 PALETTES = {
-    "light": {"card": "#ffffff", "border": "#e4e4e4", "muted": "#6b6b6b", "fill": "#d9f1de",
-              "text": "#1a1a1a", "log": "#333333"},
-    "dark": {"card": "#232323", "border": "#383838", "muted": "#a6a6a6", "fill": "#1f4a2a",
-             "text": "#ffffff", "log": "#d4d4d4"},
+    name: {
+        "card": theme["panel"],
+        "border": _solid(theme["line"], theme["panel"]),
+        "muted": theme["ink-muted"],
+        "fill": _mix(theme["panel"], theme["success"], 0.22),
+        "text": theme["ink"],
+        "log": theme["ink-muted"],
+        "danger": theme["danger"],
+        # State colours as text on the cards, per theme, so they keep their contrast on light panels too.
+        **{state: theme[token] for state, token in STATE_TOKENS.items()},
+    }
+    for name, theme in TOKENS["themes"].items()
 }
-UPLOAD = "#3b7dd8"
-# Mancubus Lab colours for the header: the same in both themes.
-BRAND = {"bg": "#15171a", "ink": "#ffffff", "muted": "#b9c0c9", "accent": "#ff681c"}
+# The header and the About window are dark in both themes, in the brand colours.
+BRAND = {"bg": _brand["charcoal"], "ink": _brand["white"], "muted": _dark["ink-muted"], "accent": _brand["orange"],
+         "panel": _dark["panel-raised"], "on": _dark["success"]}
 WEBSITE = "https://mancubus-lab.com/"
 REPOSITORY = "mancubus-lab/vpn-launcher"  # releases of this repository are the update channel
 GITHUB_RELEASE = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
@@ -708,9 +745,12 @@ def match_title_bar(window):
 
 
 def set_window_icon(window, state):
-    """Title bar and taskbar icon. macOS windows have none: the Dock icon comes from the app bundle."""
+    """Title bar and taskbar icon: the brand icon of the state, the same as in the tray.
+
+    macOS windows have none: the Dock icon comes from the app bundle.
+    """
     if WINDOWS:
-        window.iconbitmap(lock_path(state))
+        window.iconbitmap(icon_path(state))
 
 
 def display_scale(root):
@@ -754,7 +794,8 @@ def pill_button(parent, text, command, primary=False):
                                                 radius=round(7 * scale) * 4, fill=color)
         return ImageTk.PhotoImage(large.resize((width, height), Image.LANCZOS))
 
-    normal, hover = (shape(BRAND["accent"]), shape("#ff8647")) if primary else (shape("#2a2f36"), shape("#3b424c"))
+    normal, hover = ((shape(BRAND["accent"]), shape(mix(BRAND["accent"], BRAND["ink"], 0.15))) if primary
+                     else (shape(BRAND["panel"]), shape(mix(BRAND["panel"], BRAND["ink"], 0.1))))
     button = tk.Label(parent, image=normal, text=text, compound="center", font=font, fg=BRAND["ink"],
                       bg=BRAND["bg"], cursor="hand2", borderwidth=0, takefocus=True)
     button.shapes = normal, hover  # Tk does not keep the pictures alive by itself
@@ -908,7 +949,7 @@ def edit_profile(root, profile, taken):
                   else "Base32 secret of the authenticator; stored in your macOS Keychain.",
                   foreground="gray").grid(row=3, column=1, columnspan=2, sticky="w")
 
-    error = ttk.Label(body, text="", foreground="#c0392b", wraplength=420)
+    error = ttk.Label(body, text="", foreground=PALETTES[sv_ttk.get_theme()]["danger"], wraplength=420)
     error.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
     def save():
@@ -1058,7 +1099,7 @@ def main():
     titles = tk.Frame(header, bg=BRAND["bg"])
     titles.pack(side="left")
     # The version is in the window title (and in About): repeating it here would only add noise.
-    tk.Label(titles, text="VPN Launcher", bg=BRAND["bg"], fg=BRAND["ink"], font=("Segoe UI Semibold", 14)).pack(anchor="w")
+    tk.Label(titles, text="Mancubus Lab", bg=BRAND["bg"], fg=BRAND["ink"], font=("Segoe UI Semibold", 14)).pack(anchor="w")
     summary = tk.Label(titles, text="Checking...", bg=BRAND["bg"], fg=BRAND["muted"], font=("Segoe UI", 9))
     summary.pack(anchor="w")
     pill_button(header, "About", lambda: about()).pack(side="right")
@@ -1187,7 +1228,7 @@ def main():
         # The outer frame is the card's border and holds a stripe in the state colour along the left edge.
         shell = tk.Frame(frame, bg=ui["card"], highlightthickness=1, highlightbackground=ui["border"])
         shell.pack(fill="x", pady=(0, 10))  # drag_move() re-packs the cards with the same options
-        stripe = tk.Frame(shell, bg=COLORS["off"], width=max(round(5 * display_scale(root)), 3))
+        stripe = tk.Frame(shell, bg=ui["off"], width=max(round(5 * display_scale(root)), 3))
         stripe.pack(side="left", fill="y")
         card = tk.Frame(shell, bg=ui["card"], padx=14, pady=12)
         card.pack(side="left", fill="both", expand=True)
@@ -1197,7 +1238,7 @@ def main():
         title = tk.Label(card, text=p["name"], bg=ui["card"], fg=ui["text"], font=("Segoe UI Semibold", 13))
         title.grid(row=0, column=1, sticky="w")
         title.bind("<Double-Button-1>", lambda event, p=p: rename(p))
-        line = tk.Label(card, text="Checking...", bg=ui["card"], fg=COLORS["off"], font=("Segoe UI", 10))
+        line = tk.Label(card, text="Checking...", bg=ui["card"], fg=ui["off"], font=("Segoe UI", 10))
         line.grid(row=1, column=1, sticky="w")
         button = ttk.Button(card, text="Connect", width=13, command=lambda p=p: toggle(p))
         button.grid(row=0, column=3, rowspan=3, padx=(16, 0))
@@ -1307,7 +1348,7 @@ def main():
         down = graph_points([pair[0] for pair in rates], width, height, peak)
         thick = max(round(1.5 * scale), 1)
         graph.create_polygon(down[0], height - 1, *down, down[-2], height - 1, fill=ui["fill"], outline="")
-        graph.create_line(*down, fill=COLORS["on"], width=thick)
+        graph.create_line(*down, fill=ui["on"], width=thick)
         graph.create_line(*graph_points([pair[1] for pair in rates], width, height, peak), fill=UPLOAD, width=thick)
         # The scale of the graph: its highest value in the window shown.
         graph.create_text(2, 0, anchor="nw", text=f"peak {format_bytes(peak)}/s", fill=ui["muted"], font=("Segoe UI", 7))
@@ -1327,7 +1368,7 @@ def main():
         lamp, line, button = cards[name][:3]
         shown = conn["vpn"] or "off"
         lamp.configure(image=pictures["connecting" if conn["busy"] else shown])
-        cards[name][6].configure(bg=COLORS["connecting" if conn["busy"] else shown])
+        cards[name][6].configure(bg=ui["connecting" if conn["busy"] else shown])
         # The accent colour marks the action that starts something; Disconnect stays neutral.
         button.configure(text=conn["busy"] or ("Connect" if shown == "off" else "Disconnect"),
                          style="Accent.TButton" if shown == "off" and not conn["busy"] else "TButton")
@@ -1350,7 +1391,7 @@ def main():
                 if fresh.strip():
                     # The first read after a start replays the whole OpenVPN log: shown, but not written again.
                     say(fresh.rstrip(), name, to_file=previous is not None)
-            cards[name][1].configure(text=text, fg=COLORS[new])
+            cards[name][1].configure(text=text, fg=ui[new])
             if new != "on":
                 conn["traffic"], conn["rates"] = None, []
                 for cell in cards[name][3]:
@@ -1374,7 +1415,7 @@ def main():
                 notify(f"{name}: VPN connected" if new == "on" else f"{name}: VPN disconnected", text, new)
         up = sum(conn["vpn"] == "on" for conn in conns.values())
         summary.configure(text=f"{up} of {len(conns)} connected" if up else "Not connected",
-                          fg=COLORS["on"] if up else BRAND["muted"])
+                          fg=BRAND["on"] if up else BRAND["muted"])
         overall = overall_state([conn["vpn"] for conn in conns.values()])
         if overall != app["overall"]:
             app["overall"] = overall

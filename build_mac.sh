@@ -27,7 +27,7 @@ printf '%s' "$version" > build/version.txt
 "$python" -m PyInstaller --noconfirm --clean --windowed --name "VPN Launcher" --icon "$icon" \
     --osx-bundle-identifier co.mancubus.vpnlauncher --collect-data sv_ttk \
     --add-data "$PWD/build/version.txt:." --add-data "$PWD/assets/mancubus-lab.png:." \
-    --add-data "$PWD/assets/app.ico:." --add-data "$PWD/assets/icons:icons" \
+    --add-data "$PWD/assets/app.ico:." --add-data "$PWD/assets/icons:icons" --add-data "$PWD/assets/tokens.json:." \
     --distpath dist --workpath build --specpath build src/vpn_launcher.py
 
 dmg="dist/VpnLauncher-$version-$(uname -m).dmg"

@@ -38,7 +38,7 @@ New-Item -ItemType Directory -Force "$here\build" | Out-Null
 
 & $Python -m PyInstaller --noconfirm --clean --windowed --name "VPN Launcher" --icon $icon `
     --add-data "$script;." --add-data "$here\build\version.txt;." --add-data "$here\assets\mancubus-lab.png;." `
-    --add-data "$here\assets\app.ico;." --add-data "$here\assets\icons;icons" `
+    --add-data "$here\assets\app.ico;." --add-data "$here\assets\icons;icons" --add-data "$here\assets\tokens.json;." `
     --collect-data sv_ttk `
     --distpath "$here\dist" --workpath "$here\build" --specpath "$here\build" $source
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed." }
