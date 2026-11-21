@@ -1,0 +1,10 @@
+.venv/
+build/
+dist/
+__pycache__/
+*.pyc
+
+# Never commit connection profiles or credentials.
+*.ovpn
+vpn_launcher_profiles*
+vpn_launcher_settings.json
