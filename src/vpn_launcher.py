@@ -130,9 +130,14 @@ PALETTES = {
     }
     for name, theme in TOKENS["themes"].items()
 }
-# The header and the About window are dark in both themes, in the brand colours.
-BRAND = {"bg": _brand["charcoal"], "ink": _brand["white"], "muted": _dark["ink-muted"], "accent": _brand["orange"],
-         "panel": _dark["panel-raised"], "on": _dark["success"]}
+# The header, the About window and their pill buttons, per theme: charcoal in dark, white in light.
+BRANDS = {
+    name: {"bg": theme["panel"] if name == "light" else theme["bg"], "ink": theme["ink"], "muted": theme["ink-muted"],
+           "accent": theme["accent"], "on-accent": theme["on-accent"], "link": theme["accent-text"],
+           "panel": theme["panel-raised"], "on": theme["success"]}
+    for name, theme in TOKENS["themes"].items()
+}
+BRAND = dict(BRANDS["dark"])  # main() switches it to the theme in use before anything is drawn
 WEBSITE = "https://mancubus-lab.com/"
 REPOSITORY = "mancubus-lab/vpn-launcher"  # releases of this repository are the update channel
 GITHUB_RELEASE = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
@@ -778,10 +783,10 @@ def field(parent, row, label, variable, **options):
 
 
 def pill_button(parent, text, command, primary=False):
-    """Rounded button for the dark branded areas, where the themed ttk buttons look out of place.
+    """Rounded button for the branded areas (header, About), where the themed ttk buttons look out of place.
 
     The shape is a picture drawn with Pillow (Tk has no rounded widgets) with the text centred on it;
-    primary=True gives the orange accent button, otherwise a quiet dark one.
+    primary=True gives the orange accent button, otherwise a quiet one in the raised panel colour.
     """
     scale = display_scale(parent)
     font = tkfont.Font(family="Segoe UI", size=10)
@@ -797,7 +802,8 @@ def pill_button(parent, text, command, primary=False):
 
     normal, hover = ((shape(BRAND["accent"]), shape(mix(BRAND["accent"], BRAND["ink"], 0.15))) if primary
                      else (shape(BRAND["panel"]), shape(mix(BRAND["panel"], BRAND["ink"], 0.1))))
-    button = tk.Label(parent, image=normal, text=text, compound="center", font=font, fg=BRAND["ink"],
+    button = tk.Label(parent, image=normal, text=text, compound="center", font=font,
+                      fg=BRAND["on-accent"] if primary else BRAND["ink"],
                       bg=BRAND["bg"], cursor="hand2", borderwidth=0, takefocus=True)
     button.shapes = normal, hover  # Tk does not keep the pictures alive by itself
     button.bind("<Enter>", lambda event: button.configure(image=hover))
@@ -830,7 +836,7 @@ def show_about(root, check_for_updates):
     text("VPN Launcher", BRAND["ink"], ("Segoe UI Semibold", 17), pady=(16, 0))
     text(f"Version {VERSION}", BRAND["muted"], ("Segoe UI", 10))
     text("One-click OpenVPN connections with one-time codes.", BRAND["muted"], ("Segoe UI", 10), pady=(12, 14))
-    link = text("mancubus-lab.com", BRAND["accent"], ("Segoe UI", 11, "underline"))
+    link = text("mancubus-lab.com", BRAND["link"], ("Segoe UI", 11, "underline"))
     link.configure(cursor="hand2")
     link.bind("<Button-1>", lambda event: webbrowser.open(WEBSITE))
     text("© 2026 Mancubus Lab", BRAND["muted"], ("Segoe UI", 9), pady=(6, 18))
@@ -1064,6 +1070,7 @@ def main():
     settings = load_settings()
     theme = resolve_theme(settings["theme"])
     ui = PALETTES[theme]
+    BRAND.update(BRANDS[theme])
     sv_ttk.set_theme(theme)  # Windows 11 look for the ttk widgets
     root.configure(bg=ttk.Style().lookup("TFrame", "background"))
     match_title_bar(root)
@@ -1087,7 +1094,7 @@ def main():
     app = {"overall": None, "update": None}
     links, samples = {}, {}  # per connection: the open management link and the newest (time, in, out)
 
-    # Header in the Mancubus Lab colours: logo, name, a one-line summary, and the About and update buttons.
+    # Header in the Mancubus Lab colours of the theme: logo, name, a one-line summary, and the About and update buttons.
     header = tk.Frame(root, bg=BRAND["bg"], padx=18, pady=12)
     header.pack(fill="x")
     tk.Frame(root, bg=BRAND["accent"], height=max(round(3 * display_scale(root)), 2)).pack(fill="x")
@@ -1249,7 +1256,9 @@ def main():
         stripe.pack(side="left", fill="y")
         card = tk.Frame(shell, bg=ui["card"], padx=14, pady=12)
         card.pack(side="left", fill="both", expand=True)
-        card.columnconfigure(1, weight=1)
+        # Room for the longest status line, so a long uptime is not clipped by the graph next to it.
+        card.columnconfigure(1, weight=1, minsize=tkfont.Font(family="Segoe UI", size=10).measure(
+            "Connected  ·  255.255.255.255  ·  99 h 59 min"))
         lamp = tk.Label(card, image=pictures["off"], bg=ui["card"])
         lamp.grid(row=0, column=0, rowspan=3, padx=(0, 14))
         title = tk.Label(card, text=p["name"], bg=ui["card"], fg=ui["text"], font=("Segoe UI Semibold", 13))
@@ -1368,7 +1377,9 @@ def main():
         graph.create_line(*down, fill=ui["on"], width=thick)
         graph.create_line(*graph_points([pair[1] for pair in rates], width, height, peak), fill=UPLOAD, width=thick)
         # The scale of the graph: its highest value in the window shown.
-        graph.create_text(2, 0, anchor="nw", text=f"peak {format_bytes(peak)}/s", fill=ui["muted"], font=("Segoe UI", 7))
+        label = graph.create_text(2, 0, anchor="nw", text=f"peak {format_bytes(peak)}/s", fill=ui["muted"],
+                                  font=("Segoe UI", 7))
+        graph.tag_lower(graph.create_rectangle(graph.bbox(label), fill=ui["card"], outline=""), label)  # over the lines
 
     hint = ttk.Label(frame, text="" if profiles else "No profiles yet: add one to get started.",
                      foreground="gray", wraplength=360)
