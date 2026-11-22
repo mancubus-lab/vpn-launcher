@@ -242,7 +242,11 @@ try {
 
     # shortcut: dynamic challenge (CRV1) prompts are not handled, answer them over the management interface if the server uses them.
     # --script-security 1 comes after --config and therefore wins: a profile cannot make OpenVPN run scripts.
-    $options = "--config `"$cfg`" --script-security 1 --auth-user-pass `"$creds`" --log `"$log`" --management 127.0.0.1 $port `"$mgmtPw`""
+    # --reneg-sec 0: a client-side key renegotiation (hourly by default) needs the password again, but creds.txt is
+    # deleted after connect and a one-time code is spent anyway, so the tunnel died after ~55 minutes.
+    # shortcut: a server-initiated renegotiation or a soft restart still ends the tunnel; answer password prompts over
+    # the management interface (--management-query-passwords) with a fresh code if that shows up in the logs.
+    $options = "--config `"$cfg`" --script-security 1 --reneg-sec 0 --auth-user-pass `"$creds`" --log `"$log`" --management 127.0.0.1 $port `"$mgmtPw`""
     try {
         $vpnPid = Start-VpnViaService $options
     }

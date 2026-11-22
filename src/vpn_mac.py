@@ -248,7 +248,9 @@ def connect(options, stdin_text, say, risky_directives):
         (folder / "port.txt").write_text(str(port))
 
         # --script-security 1 comes after --config and therefore wins: a profile cannot make OpenVPN run scripts.
-        command = [openvpn, "--config", profile, "--script-security", "1", "--auth-user-pass", credentials,
+        # --reneg-sec 0: an hourly client renegotiation would need the deleted credentials file and a spent code.
+        command = [openvpn, "--config", profile, "--script-security", "1", "--reneg-sec", "0",
+                   "--auth-user-pass", credentials,
                    "--log", log, "--management", "127.0.0.1", port, management,
                    "--writepid", folder / "pid.txt", "--daemon"]
         run_as_root(" ".join(shlex.quote(str(part)) for part in command))
