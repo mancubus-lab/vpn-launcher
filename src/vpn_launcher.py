@@ -1068,6 +1068,14 @@ def main():
     root.title(f"VPN Launcher {VERSION}")
     set_window_icon(root, "off")
     settings = load_settings()
+    if settings["autostart"] and FROZEN:
+        # Rewritten at every start, not only when the switch is turned on: the entry must point at the program
+        # that runs now, and it can be missing although the setting is on (written from another place, or
+        # removed by a cleanup tool). A copy run from source leaves the installed program's entry alone.
+        try:
+            set_autostart(True)
+        except OSError:
+            pass  # the switch in the settings still shows the wish; nothing else depends on the entry
     theme = resolve_theme(settings["theme"])
     ui = PALETTES[theme]
     BRAND.update(BRANDS[theme])
