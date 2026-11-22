@@ -249,6 +249,8 @@ def connect(options, stdin_text, say, risky_directives):
 
         # --script-security 1 comes after --config and therefore wins: a profile cannot make OpenVPN run scripts.
         # --reneg-sec 0: an hourly client renegotiation would need the deleted credentials file and a spent code.
+        # shortcut: a server-side renegotiation still ends the tunnel here; Windows answers it over the management
+        # interface (--management-query-passwords), port that when the macOS build is used with such a server.
         command = [openvpn, "--config", profile, "--script-security", "1", "--reneg-sec", "0",
                    "--auth-user-pass", credentials,
                    "--log", log, "--management", "127.0.0.1", port, management,

@@ -5,9 +5,11 @@ Connects the OpenVPN community client using a profile, credentials and TOTP stor
 .DESCRIPTION
 Run from a NON-elevated shell: the 1Password CLI talks to the desktop app as the current user.
 openvpn.exe is started through the OpenVPN interactive service, so it runs as the user and there is no
-elevation prompt; nothing here ever runs elevated. Scripts named in a profile are blocked. The profile and
-credentials are written to a temp folder for the start of the connection and removed as soon as it is up
-or has failed.
+elevation prompt; nothing here ever runs elevated. Scripts named in a profile are blocked. The profile is
+written to a temp folder for the start of the connection and removed as soon as it is up or has failed.
+The user name and password never touch the disk: OpenVPN asks for them on its management interface
+(--management-query-passwords) and this script answers. OpenVPN asks again whenever the server renegotiates
+the keys or the connection restarts; the launcher then answers with a fresh code (-Reauth for 1Password).
 
 Every connection has a name and its own folder, log and management port under
 %TEMP%\vpn_connect_op\<Name>, so several connections run side by side and are stopped one by one.
@@ -34,13 +36,15 @@ param(
     # Used as a folder name, hence the restricted character set.
     # The connection's internal key (its number, or its old name): used as a folder name.
     [Parameter(Mandatory = $true)][ValidatePattern('^[\w-]+\z')][string]$Name,
-    [Parameter(Mandatory = $true, ParameterSetName = "Connect")][string]$Vault,
-    [Parameter(Mandatory = $true, ParameterSetName = "Connect")][string]$Item,
+    [Parameter(Mandatory = $true, ParameterSetName = "Connect")][Parameter(Mandatory = $true, ParameterSetName = "Reauth")][string]$Vault,
+    [Parameter(Mandatory = $true, ParameterSetName = "Connect")][Parameter(Mandatory = $true, ParameterSetName = "Reauth")][string]$Item,
     [Parameter(Mandatory = $true, ParameterSetName = "Connect")][string]$ProfileFile,
     [Parameter(ParameterSetName = "Connect")][string]$ProfileItem = $Item,
-    [Parameter(ParameterSetName = "Connect")][string]$OtpField = "one-time password",
+    [Parameter(ParameterSetName = "Connect")][Parameter(ParameterSetName = "Reauth")][string]$OtpField = "one-time password",
     # Auto: Scrv1 when the profile declares static-challenge, otherwise Append (password + code).
-    [Parameter(ParameterSetName = "Connect")][ValidateSet("Auto", "Append", "Scrv1", "None")][string]$OtpMode = "Auto",
+    [Parameter(ParameterSetName = "Connect")][Parameter(ParameterSetName = "Reauth")][ValidateSet("Auto", "Append", "Scrv1", "None")][string]$OtpMode = "Auto",
+    # A running 1Password connection was asked for its credentials again: answer with a fresh code.
+    [Parameter(Mandatory = $true, ParameterSetName = "Reauth")][switch]$Reauth,
     # Without 1Password: a profile file on disk; the user name and the password are read from stdin (two lines).
     [Parameter(Mandatory = $true, ParameterSetName = "File")][string]$ProfilePath,
     [Parameter(ParameterSetName = "Connect")][Parameter(ParameterSetName = "File")][int]$TimeoutSec = 90,
@@ -55,6 +59,7 @@ $log = Join-Path $work "openvpn.log"
 $mgmtPw = Join-Path $work "mgmt.txt"    # random per-connection password of the management interface
 $portFile = Join-Path $work "port.txt"  # management port on 127.0.0.1, used for a graceful stop
 $pidFile = Join-Path $work "pid.txt"    # PID of the openvpn.exe of this connection
+$modeFile = Join-Path $work "otpmode.txt"  # the OTP mode "Auto" resolved to, for -Reauth (which has no profile)
 
 # Native commands (op) print UTF-8; without this a non-ASCII password or user name arrives garbled.
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
@@ -117,6 +122,9 @@ function Stop-VpnGracefully {
     return $false
 }
 
+# Stop-Process gets "Access is denied" on an openvpn.exe the service started; taskkill can end it.
+function Stop-VpnForcibly([int]$Id) { taskkill /PID $Id /F 2>&1 | Out-Null }
+
 # Starts openvpn.exe through the OpenVPN interactive service (the mechanism OpenVPN GUI uses) and returns its PID.
 # The service does the privileged work, so there is no elevation prompt. Free-form options are accepted only
 # from members of the Administrators or "OpenVPN Administrators" group; everyone else gets an error here.
@@ -151,6 +159,55 @@ function Format-VpnPassword([string]$Pass, [string]$Otp, [string]$Mode) {
 }
 if ((Format-VpnPassword "p" "1" "Scrv1") -ne "SCRV1:cA==:MQ==") { throw "Self-check failed: SCRV1 encoding" }
 
+# User name, then password (with the code as $Mode says) from 1Password. The code is read last, to be fresh.
+function Get-OpCredentials([string]$ItemId, [string]$Mode) {
+    $user = Read-OpSecret "op://$Vault/$ItemId/username"
+    $pass = Read-OpSecret "op://$Vault/$ItemId/password"
+    $otp = if ($Mode -ne "None") { Read-OpSecret "op://$Vault/$ItemId/${OtpField}?attribute=otp" } else { "" }
+    return $user, (Format-VpnPassword $pass $otp $Mode)
+}
+
+# A management command argument: in double quotes, with backslashes and quotes escaped.
+function ConvertTo-MgmtArgument([string]$Text) { '"' + $Text.Replace('\', '\\').Replace('"', '\"') + '"' }
+if ((ConvertTo-MgmtArgument 'a"b\') -ne '"a\"b\\"') { throw "Self-check failed: management quoting" }
+
+# Opens the management interface of this connection (retrying while OpenVPN starts) and logs in.
+function Open-Mgmt([datetime]$Deadline) {
+    while ($true) {
+        try { $client = [Net.Sockets.TcpClient]::new("127.0.0.1", [int](Get-Content $portFile -TotalCount 1)); break }
+        catch {
+            if ((Get-Date) -gt $Deadline -or -not (Get-VpnProcess)) { throw "the OpenVPN management interface did not open" }
+            Start-Sleep -Milliseconds 300
+        }
+    }
+    $stream = $client.GetStream()
+    $writer = [IO.StreamWriter]::new($stream)
+    $writer.NewLine = "`n"
+    $writer.AutoFlush = $true
+    $writer.WriteLine((Get-Content $mgmtPw -TotalCount 1))
+    @{ Client = $client; Reader = [IO.StreamReader]::new($stream); Writer = $writer; Pending = $null }
+}
+
+# The management lines that have arrived so far, without waiting for more.
+function Receive-MgmtLines($Mgmt) {
+    $lines = @()
+    while ($true) {
+        if (-not $Mgmt.Pending) { $Mgmt.Pending = $Mgmt.Reader.ReadLineAsync() }
+        if (-not $Mgmt.Pending.IsCompleted) { return $lines }
+        $line = $Mgmt.Pending.Result
+        $Mgmt.Pending = $null
+        if ($null -eq $line) { return $lines }
+        $lines += $line
+    }
+}
+
+function Send-MgmtCredentials($Mgmt, [string]$User, [string]$Secret) {
+    $Mgmt.Writer.WriteLine("username `"Auth`" $(ConvertTo-MgmtArgument $User)")
+    $Mgmt.Writer.WriteLine("password `"Auth`" $(ConvertTo-MgmtArgument $Secret)")
+}
+
+$passwordPrompt = ">PASSWORD:Need 'Auth'"
+
 $running = Get-VpnProcess
 
 if ($Status -or $Disconnect) {
@@ -161,11 +218,11 @@ if ($Status -or $Disconnect) {
         if ($forced) {
             # shortcut: the fallback force-kills the process and leaves its routes behind, they go away with the next graceful stop.
             # The process runs as the user (it was started through the service), so no elevation is involved.
-            Stop-Process -Id $running.Id -Force -ErrorAction SilentlyContinue
+            Stop-VpnForcibly $running.Id
             Start-Sleep -Seconds 1
             if (Get-VpnProcess) { throw "${Name}: openvpn.exe (PID $($running.Id)) could not be stopped. End it in Task Manager." }
         }
-        Remove-Item $mgmtPw, $portFile, $pidFile -ErrorAction SilentlyContinue
+        Remove-Item $mgmtPw, $portFile, $pidFile, $modeFile -ErrorAction SilentlyContinue
         if ($forced) { "${Name}: disconnected (forced: the graceful stop was not available)." } else { "${Name}: disconnected." }
         return
     }
@@ -186,6 +243,33 @@ if ($Status -or $Disconnect) {
     return
 }
 
+if ($Reauth) {
+    if (-not $running) { throw "${Name}: not connected." }
+    $script:op = Find-OpCli
+    $mode = if ($OtpMode -ne "Auto") { $OtpMode } else { "$(Get-Content $modeFile -TotalCount 1 -ErrorAction SilentlyContinue)" }
+    if ($mode -notin "Append", "Scrv1", "None") { $mode = "Append" }
+    # Credentials first: a 1Password approval may take a while, the management interface is held only briefly.
+    $user, $secret = Get-OpCredentials (Resolve-OpItemId $Item) $mode
+    $mgmt = Open-Mgmt (Get-Date).AddSeconds(10)
+    try {
+        $deadline = (Get-Date).AddSeconds(30)
+        $sent = $false
+        while ((Get-Date) -lt $deadline) {
+            foreach ($line in Receive-MgmtLines $mgmt) {
+                if (-not $sent -and $line.StartsWith($passwordPrompt)) { Send-MgmtCredentials $mgmt $user $secret; $sent = $true }
+                elseif ($sent -and $line -match "^(SUCCESS: 'Auth' password|ERROR)") {
+                    if ($line.StartsWith("ERROR")) { throw "${Name}: OpenVPN refused the credentials: $line" }
+                    "${Name}: the server asked to sign in again; a fresh code was sent."
+                    return
+                }
+            }
+            Start-Sleep -Milliseconds 200
+        }
+        throw "${Name}: OpenVPN did not ask for the credentials within 30 seconds."
+    }
+    finally { $mgmt.Client.Close() }
+}
+
 if ($running) { throw "${Name} is already running. Run with -Disconnect first." }
 
 New-Item -ItemType Directory -Force $work | Out-Null
@@ -194,9 +278,10 @@ $fromOp = $PSCmdlet.ParameterSetName -eq "Connect"
 # file. The service starts OpenVPN outside this process's environment, so it must not depend on a path that
 # only this process can see (a packaged parent app, for example, gets a private view of %APPDATA%).
 $cfg = Join-Path $work "profile.ovpn"
-$creds = Join-Path $work "creds.txt"
-Remove-Item $creds -ErrorAction SilentlyContinue  # left behind if an earlier run was killed before its cleanup
+# Versions before 1.2.20 wrote the credentials to this file; one may be left behind by a killed run.
+Remove-Item (Join-Path $work "creds.txt") -ErrorAction SilentlyContinue
 $state = "timeout"
+$mgmt = $null
 
 try {
     if ($fromOp) {
@@ -211,11 +296,8 @@ try {
             $OtpMode = if (Select-String -Path $cfg -Pattern '^\s*static-challenge' -Quiet) { "Scrv1" } else { "Append" }
         }
 
-        $user = Read-OpSecret "op://$Vault/$itemId/username"
-        $pass = Read-OpSecret "op://$Vault/$itemId/password"
-        # The code is fetched last so that it is as fresh as possible when the server checks it.
-        $otp = if ($OtpMode -ne "None") { Read-OpSecret "op://$Vault/$itemId/${OtpField}?attribute=otp" } else { "" }
-        $secret = Format-VpnPassword $pass $otp $OtpMode
+        [IO.File]::WriteAllText($modeFile, $OtpMode)
+        $user, $secret = Get-OpCredentials $itemId $OtpMode
         $authNote = "OTP mode was $OtpMode"
     }
     else {
@@ -229,7 +311,6 @@ try {
         $authNote = "the password was typed by the user"
     }
 
-    [IO.File]::WriteAllText($creds, "$user`n$secret`n")
     Remove-Item $log -ErrorAction SilentlyContinue
     [IO.File]::WriteAllText($mgmtPw, [guid]::NewGuid().ToString("N") + "`n")
 
@@ -242,11 +323,10 @@ try {
 
     # shortcut: dynamic challenge (CRV1) prompts are not handled, answer them over the management interface if the server uses them.
     # --script-security 1 comes after --config and therefore wins: a profile cannot make OpenVPN run scripts.
-    # --reneg-sec 0: a client-side key renegotiation (hourly by default) needs the password again, but creds.txt is
-    # deleted after connect and a one-time code is spent anyway, so the tunnel died after ~55 minutes.
-    # shortcut: a server-initiated renegotiation or a soft restart still ends the tunnel; answer password prompts over
-    # the management interface (--management-query-passwords) with a fresh code if that shows up in the logs.
-    $options = "--config `"$cfg`" --script-security 1 --reneg-sec 0 --auth-user-pass `"$creds`" --log `"$log`" --management 127.0.0.1 $port `"$mgmtPw`""
+    # --auth-user-pass without a file plus --management-query-passwords: OpenVPN asks for the credentials on the
+    # management interface. --auth-nocache: it asks again at every key renegotiation and restart instead of
+    # resending a spent one-time code. --reneg-sec 0 drops the client's own hourly renegotiation (the server's stays).
+    $options = "--config `"$cfg`" --script-security 1 --reneg-sec 0 --auth-user-pass --auth-nocache --management-query-passwords --log `"$log`" --management 127.0.0.1 $port `"$mgmtPw`""
     try {
         $vpnPid = Start-VpnViaService $options
     }
@@ -258,25 +338,41 @@ try {
     $proc = Get-Process -Id $vpnPid -ErrorAction SilentlyContinue
 
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $mgmt = Open-Mgmt $deadline
+    $asked = 0
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 500
+        foreach ($line in Receive-MgmtLines $mgmt) {
+            if (-not $line.StartsWith($passwordPrompt)) { continue }
+            # A retry after a failed first attempt (a TLS timeout, say) asks again: 1Password gives a fresh code.
+            if ($asked++ -and $fromOp) { $user, $secret = Get-OpCredentials $itemId $OtpMode }
+            Send-MgmtCredentials $mgmt $user $secret
+        }
         $text = if (Test-Path $log) { Get-Content $log -Raw } else { "" }
         if ($text -match "Initialization Sequence Completed") { $state = "connected"; break }
         if ($text -match "AUTH_FAILED") { $state = "auth failed ($authNote)"; break }
         if (-not $proc -or $proc.HasExited) { $state = "openvpn exited"; break }
     }
 }
+catch {
+    # A failure after the start must still reach the cleanup below, or OpenVPN keeps waiting for a password.
+    if (-not (Get-VpnProcess)) { throw }
+    $state = "$_"
+}
 finally {
-    Remove-Item $creds, $cfg -ErrorAction SilentlyContinue
+    # The management interface takes one client: free it for the launcher, which answers later requests.
+    if ($mgmt) { $mgmt.Client.Close() }
+    $user = $secret = $null
+    Remove-Item $cfg -ErrorAction SilentlyContinue
 }
 
 if ($state -ne "connected") {
     Get-Content $log -Tail 20 -ErrorAction SilentlyContinue
     # Do not leave OpenVPN retrying in the background with a one-time code that is already spent.
     if (Get-VpnProcess) {
-        if (-not (Stop-VpnGracefully)) { Get-VpnProcess | Stop-Process -Force -ErrorAction SilentlyContinue }
+        if (-not (Stop-VpnGracefully)) { Get-VpnProcess | ForEach-Object { Stop-VpnForcibly $_.Id } }
     }
-    Remove-Item $mgmtPw, $portFile, $pidFile -ErrorAction SilentlyContinue
+    Remove-Item $mgmtPw, $portFile, $pidFile, $modeFile -ErrorAction SilentlyContinue
     throw "${Name} is not connected: $state. Full log: $log"
 }
 "${Name}: connected. Check with -Status, stop with -Disconnect."

@@ -608,11 +608,24 @@ for bad in ({"name": "  ", "vault": "v", "item": "i", "profile_file": "f"}, {"na
         pass
 
 
-def watch_traffic(name, links, samples):
+PASSWORD_PROMPT = ">PASSWORD:Need 'Auth'"
+
+
+def management_argument(text):
+    """A management command argument: in double quotes, with backslashes and quotes escaped."""
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+assert management_argument('a"b\\') == '"a\\"b\\\\"'
+
+
+def watch_traffic(name, links, samples, on_password):
     """Thread body: holds one management link open and stores the counters OpenVPN pushes every 2 s.
 
     One long-lived link instead of polling, because OpenVPN logs every management connection and command.
     The link is the only one OpenVPN accepts, so it must be closed before the script stops the connection.
+    When OpenVPN asks for the credentials again (a key renegotiation or a restart), on_password(name, link)
+    answers; it returns True when it gave the link away, and the next refresh opens a new one.
     """
     try:
         port = int((WORK / name / "port.txt").read_text())
@@ -622,6 +635,8 @@ def watch_traffic(name, links, samples):
             link.settimeout(None)
             link.sendall(f"{password}\nbytecount 2\n".encode())
             for line in link.makefile("r", errors="replace"):
+                if line.startswith(PASSWORD_PROMPT) and on_password(name, link):
+                    break
                 traffic = parse_traffic(line)
                 if traffic:
                     samples[name] = (time.monotonic(), *traffic)
@@ -1554,15 +1569,16 @@ def main():
                     # The first read after a start replays the whole OpenVPN log: shown, but not written again.
                     say(fresh.rstrip(), label_for(name), to_file=previous is not None)
             cards[name][1].configure(text=text, fg=ui[new])
+            # Also while reconnecting: OpenVPN may be waiting on the link for the credentials.
+            if new != "off" and not conn["busy"] and name not in links:
+                links[name] = None  # reserved, so that the next refresh does not start a second watcher
+                threading.Thread(target=watch_traffic, args=(name, links, samples, answer_password), daemon=True).start()
             if new != "on":
                 conn["traffic"], conn["rates"] = None, []
                 for cell in cards[name][3]:
                     cell.configure(text="")
                 draw_graph(name)
             elif not conn["busy"]:
-                if name not in links:
-                    links[name] = None  # reserved, so that the next refresh does not start a second watcher
-                    threading.Thread(target=watch_traffic, args=(name, links, samples), daemon=True).start()
                 sample, last = samples.get(name), conn["traffic"]
                 if sample and sample != last:  # no new sample: the previous line stays
                     rate = traffic_rate(last and last[1:], sample[1:], sample[0] - last[0] if last else 0)
@@ -1638,6 +1654,42 @@ def main():
         say(busy, label_for(name))
         background(lambda: run_script("-Name", name, *args, stdin_text=stdin_text),
                    lambda result: finish(name, result))
+
+    def answer_password(name, link):
+        """Watcher thread: OpenVPN asks for the credentials again (the server renegotiates keys, or a restart).
+
+        The one-time code from the first sign-in is spent, so a fresh one is sent. Returns True when the link
+        was closed for the connect script, which answers 1Password profiles itself.
+        """
+        p = next((p for p in profiles if p["key"] == name), None)
+
+        def tell(text):
+            finished.put((lambda _: say(text, label_for(name)), None))
+
+        if not p:
+            return False
+        if p.get("source") != "file":
+            tell("The server asked to sign in again: getting a fresh code from 1Password...")
+            # shutdown, not close: the reader's makefile keeps the socket open until it is closed itself.
+            link.shutdown(socket.SHUT_RDWR)
+            code, text = run_script("-Name", name, "-Reauth", "-Vault", p["vault"], "-Item", p["item"],
+                                    "-OtpField", p.get("otp_field") or "one-time password",
+                                    "-OtpMode", p.get("otp_mode") or "Auto")
+            tell(text or f"exit code {code}")
+            return True
+        try:
+            if not (p.get("otp_key") and p.get("username")):
+                raise ValueError("this profile has no saved one-time code key")
+            fresh = totp(unprotect(p["otp_key"]))
+        except Exception as err:
+            # shortcut: a typed password is not kept, so the tunnel is stopped; ask for it here if that is too often.
+            tell(f"The server asked to sign in again, but {err}: disconnecting. Connect again.")
+            link.sendall(b"signal SIGTERM\n")
+            return False
+        link.sendall(f'username "Auth" {management_argument(p["username"])}\n'
+                     f'password "Auth" {management_argument(fresh)}\n'.encode())
+        tell("The server asked to sign in again: a fresh code was sent.")
+        return False
 
     def look_for_update(asked=False):
         """Asks GitHub for a newer release; asked=True when the user pressed the button and wants an answer."""
