@@ -1379,7 +1379,8 @@ def main():
         # The scale of the graph: its highest value in the window shown.
         label = graph.create_text(2, 0, anchor="nw", text=f"peak {format_bytes(peak)}/s", fill=ui["muted"],
                                   font=("Segoe UI", 7))
-        graph.tag_lower(graph.create_rectangle(graph.bbox(label), fill=ui["card"], outline=""), label)  # over the lines
+        _, _, right, bottom = graph.bbox(label)  # the backing starts at the left edge, where the lines start too
+        graph.tag_lower(graph.create_rectangle(0, 0, right + 2, bottom, fill=ui["card"], outline=""), label)
 
     hint = ttk.Label(frame, text="" if profiles else "No profiles yet: add one to get started.",
                      foreground="gray", wraplength=360)
