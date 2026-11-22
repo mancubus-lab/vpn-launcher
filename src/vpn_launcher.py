@@ -1408,6 +1408,9 @@ def main():
         if not drag["moved"]:
             drag["moved"] = True
             root.configure(cursor="fleur")
+            # The card being carried gets an accent frame, so it is clear which one moves while the others shift.
+            cards[p["key"]][7].configure(highlightbackground=BRAND["accent"], highlightcolor=BRAND["accent"],
+                                         highlightthickness=2)
         # The card goes to the position of the card whose middle the pointer has passed.
         others = [q for q in profiles if q is not p]
         position = sum(pointer_y > cards[q["key"]][7].winfo_rooty() + cards[q["key"]][7].winfo_height() / 2
@@ -1423,6 +1426,9 @@ def main():
     def drag_end():
         if drag["moved"]:
             root.configure(cursor="")
+            if drag["profile"]["key"] in cards:
+                cards[drag["profile"]["key"]][7].configure(highlightbackground=ui["border"],
+                                                           highlightcolor=ui["border"], highlightthickness=1)
             save_profiles(profiles)
         drag.update(profile=None, moved=False)
 
