@@ -473,15 +473,63 @@ if WINDOWS:  # not on macOS: a check at every start would leave an entry in the 
     assert unprotect(protect("round trip")) == "round trip"
 
 
+# A profile has three identities:
+#   "id"   - its number, shown on the card (#3); assigned once, never reused while the profile exists;
+#   "key"  - what the connect script and the work folder are called: str(id) for new profiles, the former
+#            name for profiles made before numbers existed (their running VPNs keep their folders);
+#   "name" - only a label for the user: any text, may repeat, can change at any time.
+KEY_PATTERN = r"[\w-]+"  # the connect script checks the same pattern
+LABEL_LENGTH = 60
+
+
+def check_label(label):
+    """The label as it is stored, or ValueError."""
+    label = " ".join(label.split())
+    if not label:
+        raise ValueError("The name is empty")
+    if len(label) > LABEL_LENGTH:
+        raise ValueError(f"The name is longer than {LABEL_LENGTH} characters")
+    return label
+
+
 def check_profile(profile):
-    """Raises ValueError when a profile entry cannot be used."""
-    name = profile.get("name", "")
-    if not re.fullmatch(r"[\w-]+", name):  # the name becomes a folder name in the script
-        raise ValueError(f"Name {name!r}: use only letters, digits, _ and -")
+    """Raises ValueError when a profile entry cannot be used; id and key are checked when present."""
+    name = check_label(profile.get("name", ""))
+    if "key" in profile and not re.fullmatch(KEY_PATTERN, str(profile["key"])):
+        raise ValueError(f"{name}: the internal key {profile['key']!r} is not valid")
+    if "id" in profile and not (isinstance(profile["id"], int) and profile["id"] > 0):
+        raise ValueError(f"{name}: the number {profile['id']!r} is not valid")
     keys = ("profile_path",) if profile.get("source") == "file" else ("vault", "item", "profile_file")
     for key in keys:
         if not profile.get(key):
             raise ValueError(f"{name}: {key.replace('_', ' ')} is empty")
+
+
+def number_profiles(profiles):
+    """Gives every profile without an id the next free number; True when something was added.
+
+    A profile from before numbers keeps its name as the key, so its work folder (and a VPN running from
+    it) stays the same; a new one is keyed by its number.
+    """
+    changed = False
+    for profile in profiles:
+        if "id" not in profile:
+            profile["id"] = max((p.get("id", 0) for p in profiles), default=0) + 1
+            changed = True
+        if "key" not in profile:
+            profile["key"] = profile["name"] if re.fullmatch(KEY_PATTERN, profile.get("name", "")) else str(profile["id"])
+            changed = True
+    return changed
+
+
+def label_of(profile):
+    return f"#{profile['id']} {profile['name']}"
+
+
+_old = [{"name": "Prod"}, {"name": "Dev 1 pass"}, {"name": "x", "id": 7, "key": "7"}]
+assert number_profiles(_old) and [(p["id"], p["key"]) for p in _old] == [(8, "Prod"), (9, "9"), (7, "7")]
+assert not number_profiles(_old) and label_of(_old[0]) == "#8 Prod"
+assert check_label("  Dev   1 pass ") == "Dev 1 pass"
 
 
 # Profile directives that make OpenVPN run a program, load code or write a file of the profile's choosing.
@@ -529,11 +577,14 @@ def load_profiles():
     if not PROFILES.exists():
         return []
     profiles = json.loads(PROFILES.read_text(encoding="utf-8"))
+    if number_profiles(profiles):
+        save_json(PROFILES, profiles)
     for profile in profiles:
         check_profile(profile)
-    # Compared without case: the name is a folder name, and Windows folders ignore case.
-    if len({p["name"].casefold() for p in profiles}) != len(profiles):
-        raise ValueError("profile names must be unique")
+    # Compared without case: the key is a folder name, and Windows folders ignore case.
+    if len({str(p["key"]).casefold() for p in profiles}) != len(profiles) or \
+            len({p["id"] for p in profiles}) != len(profiles):
+        raise ValueError("profile numbers must be unique")
     return profiles
 
 
@@ -546,7 +597,10 @@ assert traffic_cells((1024, 512), (2048, 1024)) == ["↓", "1.0 KB/s", "total", 
 assert traffic_cells(None, (2048, 1024))[:4] == ["↓", "", "total", "2.0 KB"]
 assert graph_points([0, 10], 59, 24, 10) == [0, 22, 1, 2]
 check_profile({"name": "Lab", "source": "file", "profile_path": "x.ovpn"})
-for bad in ({"name": "a b", "vault": "v", "item": "i", "profile_file": "f"}, {"name": "Lab", "source": "file"}):
+check_profile({"name": "Dev 1 pass / прод", "source": "file", "profile_path": "x.ovpn", "id": 3, "key": "3"})
+for bad in ({"name": "  ", "vault": "v", "item": "i", "profile_file": "f"}, {"name": "Lab", "source": "file"},
+            {"name": "Lab", "source": "file", "profile_path": "x", "key": "a/b"},
+            {"name": "Lab", "source": "file", "profile_path": "x", "id": 0}):
     try:
         check_profile(bad)
         raise AssertionError(bad)
@@ -966,9 +1020,8 @@ def edit_profile(root, profile, taken):
         new = {"name": values["name"].get().strip(), "source": source,
                **{key: values[key].get().strip() for key in keys}}
         try:
+            new["name"] = check_label(new["name"])  # only a label: any text, it may repeat
             check_profile(new)
-            if new["name"].casefold() in taken:
-                raise ValueError(f"{new['name']}: this name is already used")
             if source == "file":
                 if new_key.get().strip():
                     try:
@@ -1093,7 +1146,11 @@ def main():
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as err:
         messagebox.showerror("VPN Launcher", f"Cannot read {PROFILES}:\n{err}")
         return
-    names = [p["name"] for p in profiles]
+    names = [p["key"] for p in profiles]  # the internal keys: work folders, script names, dictionary keys
+
+    def label_for(key):
+        """What the user sees for a connection: its number and its name."""
+        return next((label_of(p) for p in profiles if p["key"] == key), key)
 
     # Per connection: vpn is a COLORS key (None until the first check), busy is the label of a running action.
     # traffic is the last sample: (time, bytes in, bytes out).
@@ -1178,7 +1235,7 @@ def main():
     root.after(50, deliver)
 
     def toggle(p):
-        conn = conns[p["name"]]
+        conn = conns[p["key"]]
         # grab_current: a dialog is open; the tray menu must not start a second action behind it.
         if conn["busy"] or conn["vpn"] is None or root.grab_current():
             return
@@ -1188,32 +1245,32 @@ def main():
                 try:
                     typed = p["username"], totp(unprotect(p["otp_key"]))
                 except Exception as err:  # the key was saved by another Windows user or on another machine
-                    hint.configure(text=f"{p['name']}: the saved one-time code key cannot be read ({err}).")
+                    hint.configure(text=f"{label_of(p)}: the saved one-time code key cannot be read ({err}).")
                     return
             else:
-                typed = ask_credentials(root, p["name"], p.get("username", ""))
+                typed = ask_credentials(root, label_of(p), p.get("username", ""))
             if not typed:
                 return
             if typed[0] != p.get("username"):  # remembered for the next time; the password never is
                 p["username"] = typed[0]
                 save_profiles(profiles)
-            start(p["name"], "Connecting...", "",
+            start(p["key"], "Connecting...", "",
                   ["-ProfilePath", p["profile_path"]], stdin_text=f"{typed[0]}\n{typed[1]}\n")
         elif conn["vpn"] == "off":
-            start(p["name"], "Connecting...",
-                  f"{p['name']}: approve the 1Password prompt." + ("" if WINDOWS else " Then the administrator prompt."),
+            start(p["key"], "Connecting...",
+                  f"{label_of(p)}: approve the 1Password prompt." + ("" if WINDOWS else " Then the administrator prompt."),
                   ["-Vault", p["vault"], "-Item", p["item"], "-ProfileFile", p["profile_file"],
                    "-OtpField", p.get("otp_field") or "one-time password", "-OtpMode", p.get("otp_mode") or "Auto"])
         else:
-            if not confirm(root, f"Disconnect {p['name']}?"):
+            if not confirm(root, f"Disconnect {label_of(p)}?"):
                 return
-            link = links.get(p["name"])
+            link = links.get(p["key"])
             if link:  # free the management interface for the script's graceful stop
                 try:
                     link.shutdown(socket.SHUT_RDWR)
                 except OSError:
                     pass
-            start(p["name"], "Disconnecting...", "", ["-Disconnect"])
+            start(p["key"], "Disconnecting...", "", ["-Disconnect"])
 
     def save_profiles(items):
         save_json(PROFILES, items)
@@ -1222,24 +1279,26 @@ def main():
         """Adds (p is None), changes or deletes a profile, then rebuilds the cards in place."""
         if root.grab_current():
             return
-        if p and conns[p["name"]]["vpn"] != "off":
-            hint.configure(text=f"Disconnect {p['name']} before changing it.")
+        if p and conns[p["key"]]["vpn"] != "off":
+            hint.configure(text=f"Disconnect {label_of(p)} before changing it.")
             return
         if any(conn["busy"] for conn in conns.values()):  # the cards are rebuilt after saving: not mid-action
             hint.configure(text="Wait until the running connect or disconnect has finished.")
             return
-        answer = edit_profile(root, p, {name.casefold() for name in names if not p or name != p["name"]})
+        answer = edit_profile(root, p, set())  # names are labels: they may repeat
         if not answer:
             return
         items = list(profiles)
         if answer[0] == "delete":
-            if not confirm(root, f"Delete profile {p['name']}?"):
+            if not confirm(root, f"Delete profile {label_of(p)}?"):
                 return
             items.remove(p)
         elif p:
-            items[items.index(p)] = answer[1]
+            # The number and the internal key belong to the connection, not to what the editor shows.
+            items[items.index(p)] = {**answer[1], "id": p["id"], "key": p["key"]}
         else:
             items.append(answer[1])
+            number_profiles(items)  # a new connection gets the next number, and that number as its key
         save_profiles(items)
         # The copy made on import holds keys: remove it once no profile points at it any more.
         imported = Path((p or {}).get("profile_path") or "-")
@@ -1278,6 +1337,9 @@ def main():
         # The name with a pencil after it: a click on the pencil or a double click on the name renames.
         name_row = tk.Frame(card, bg=ui["card"])
         name_row.grid(row=0, column=1, sticky="w")
+        # The connection's number: it stays the same whatever the name is.
+        tk.Label(name_row, text=f"#{p['id']}", bg=ui["card"], fg=ui["muted"], font=("Segoe UI Semibold", 13)).pack(
+            side="left", padx=(0, 6))
         title = tk.Label(name_row, text=p["name"], bg=ui["card"], fg=ui["text"], font=("Segoe UI Semibold", 13),
                          cursor="xterm")
         title.pack(side="left")
@@ -1306,7 +1368,7 @@ def main():
             flow.append(cell)
         graph = tk.Canvas(card, width=graph_size[0], height=graph_size[1], bg=ui["card"], highlightthickness=0)
         graph.grid(row=0, column=2, rowspan=3, padx=(16, 0))
-        cards[p["name"]] = lamp, line, button, flow, graph, edit_button, stripe, shell, title
+        cards[p["key"]] = lamp, line, button, flow, graph, edit_button, stripe, shell, title
         # The card is dragged by any of its passive parts; the buttons keep their own clicks.
         for handle in (card, grip, lamp, name_row, title, line, table, graph, stripe, *flow):
             handle.bind("<ButtonPress-1>", lambda event, p=p: drag.update(profile=p, start=event.y_root, moved=False))
@@ -1325,14 +1387,14 @@ def main():
             parts[7].destroy()  # the card's outer frame
         cards.clear()
         profiles[:] = items
-        names[:] = [item["name"] for item in items]
-        for name in [name for name in conns if name not in names]:
-            del conns[name]
+        names[:] = [item["key"] for item in items]
+        for key in [key for key in conns if key not in names]:
+            del conns[key]
         for item in items:
-            # A new or renamed profile starts unknown; an unchanged name keeps what is known about it.
-            conns.setdefault(item["name"], {"vpn": None, "busy": "", "log": "", "traffic": None, "rates": []})
+            # A new profile starts unknown; an existing one keeps what is known about it.
+            conns.setdefault(item["key"], {"vpn": None, "busy": "", "log": "", "traffic": None, "rates": []})
             build_card(item)
-            update_card(item["name"])
+            update_card(item["key"])
         hint.configure(text="" if items else "No profiles yet: add one to get started.")
         check_now()
 
@@ -1348,15 +1410,15 @@ def main():
             root.configure(cursor="fleur")
         # The card goes to the position of the card whose middle the pointer has passed.
         others = [q for q in profiles if q is not p]
-        position = sum(pointer_y > cards[q["name"]][7].winfo_rooty() + cards[q["name"]][7].winfo_height() / 2
+        position = sum(pointer_y > cards[q["key"]][7].winfo_rooty() + cards[q["key"]][7].winfo_height() / 2
                        for q in others)
         if profiles.index(p) != position:
             profiles.remove(p)
             profiles.insert(position, p)
             for q in profiles:
-                cards[q["name"]][7].pack_forget()
+                cards[q["key"]][7].pack_forget()
             for q in profiles:
-                cards[q["name"]][7].pack(fill="x", pady=(0, 10), before=add_button)
+                cards[q["key"]][7].pack(fill="x", pady=(0, 10), before=add_button)
 
     def drag_end():
         if drag["moved"]:
@@ -1365,52 +1427,49 @@ def main():
         drag.update(profile=None, moved=False)
 
     def rename(p):
-        """Double click on the name: edit it in place. Enter or a click elsewhere keeps it, Escape gives up."""
+        """Double click on the name: edit it in place. Enter or a click elsewhere keeps it, Escape gives up.
+
+        The name is only a label, so it can change even while the VPN is connected.
+        """
         old = p["name"]
         if root.grab_current() or drag["moved"]:
             return
-        if conns[old]["busy"] or conns[old]["vpn"] != "off":
-            hint.configure(text=f"Disconnect {old} before renaming it.")
-            return
-        title = cards[old][8]
+        title = cards[p["key"]][8]
         text = tk.StringVar(value=old)
         # Laid over the name and its pencil, in the card's grid cell they share.
         entry = ttk.Entry(title.master.master, textvariable=text, font=("Segoe UI Semibold", 12), width=24)
         entry.grid(row=0, column=1, sticky="w")
         entry.select_range(0, "end")
         entry.focus_set()
-        hint.configure(text="Enter or a click elsewhere saves the name, Esc cancels. "
-                            "Letters, digits, _ and - only, no spaces.")
+        problem = tk.Label(entry.master, bg=ui["card"], fg=ui["danger"], font=("Segoe UI", 9))  # gridded on refusal
+
+        def close():
+            entry.destroy()
+            problem.destroy()
+        hint.configure(text="Enter or a click elsewhere saves the name, Esc cancels.")
 
         def keep(event=None):
             if not entry.winfo_exists():
                 return  # already closed: Enter closes it, and the focus leaving afterwards calls this again
-            new = text.get().strip()
-            if new == old:
-                entry.destroy()
-                hint.configure(text="")
-                return
             try:
-                check_profile({**p, "name": new})
-                if new.casefold() in {name.casefold() for name in names if name != old}:
-                    raise ValueError(f"{new}: this name is already used")
+                new = check_label(text.get())
             except ValueError as error:
                 hint.configure(text=f"Not renamed. {error}")
                 if event is not None and event.type == tk.EventType.FocusOut:
-                    entry.destroy()  # the user went elsewhere: leave the old name, the line says why
+                    close()  # the user went elsewhere: leave the old name, the line under the cards says why
+                else:  # right under the field, where the user is looking, over the card's status line
+                    problem.configure(text=str(error))
+                    problem.grid(row=1, column=1, sticky="w")
                 return
-            # The name is the key of everything kept per connection; the buttons read it from p when pressed.
-            p["name"] = new
-            names[names.index(old)] = new
-            conns[new] = conns.pop(old)
-            cards[new] = cards.pop(old)
-            title.configure(text=new)
-            save_profiles(profiles)
+            if new != old:
+                p["name"] = new
+                title.configure(text=new)
+                save_profiles(profiles)
             hint.configure(text="")
-            entry.destroy()
+            close()
 
         def cancel(event=None):
-            entry.destroy()
+            close()
             hint.configure(text="")
 
         entry.bind("<Return>", keep)
@@ -1474,7 +1533,7 @@ def main():
                 fresh = "\n".join(row for row in fresh.splitlines() if " MANAGEMENT: " not in row)
                 if fresh.strip():
                     # The first read after a start replays the whole OpenVPN log: shown, but not written again.
-                    say(fresh.rstrip(), name, to_file=previous is not None)
+                    say(fresh.rstrip(), label_for(name), to_file=previous is not None)
             cards[name][1].configure(text=text, fg=ui[new])
             if new != "on":
                 conn["traffic"], conn["rates"] = None, []
@@ -1496,7 +1555,7 @@ def main():
                         draw_graph(name)
             update_card(name)
             if previous and previous != new and (new == "on" or previous == "on"):
-                notify(f"{name}: VPN connected" if new == "on" else f"{name}: VPN disconnected", text, new)
+                notify(f"{label_for(name)}: VPN connected" if new == "on" else f"{label_for(name)}: VPN disconnected", text, new)
         up = sum(conn["vpn"] == "on" for conn in conns.values())
         summary.configure(text=f"{up} of {len(conns)} connected" if up else "Not connected",
                           fg=BRAND["on"] if up else BRAND["muted"])
@@ -1542,13 +1601,13 @@ def main():
 
     def finish(name, result):
         code, text = result
-        say(text or f"exit code {code}", name)
+        say(text or f"exit code {code}", label_for(name))
         conns[name]["busy"] = ""
         update_card(name)
         if code == 0:
             hint.configure(text="")
         else:
-            hint.configure(text=f"{name}: failed. See the log below.")
+            hint.configure(text=f"{label_for(name)}: failed. See the log below.")
             checks["show_log"].set(True)
             on_toggle("show_log")
         check_now()
@@ -1557,7 +1616,7 @@ def main():
         conns[name]["busy"] = busy
         update_card(name)
         hint.configure(text=tip)
-        say(busy, name)
+        say(busy, label_for(name))
         background(lambda: run_script("-Name", name, *args, stdin_text=stdin_text),
                    lambda result: finish(name, result))
 
@@ -1718,14 +1777,14 @@ def main():
         """(text, action, enabled) rows; every connection has its own connect or disconnect row."""
         items = []
         for p in profiles:
-            conn = conns[p["name"]]
+            conn = conns[p["key"]]
             verb = "Disconnect" if conn["vpn"] in ("connecting", "on") else "Connect"
-            items.append((f"{verb} {p['name']}", lambda p=p: toggle(p), not conn["busy"] and conn["vpn"] is not None))
+            items.append((f"{verb} {label_of(p)}", lambda p=p: toggle(p), not conn["busy"] and conn["vpn"] is not None))
         return items + [("Open window", show_window, True), ("About", about, True), ("Exit", quit_app, True)]
 
     def tray_tip():
         words = {None: "checking", "off": "off", "connecting": "connecting", "on": "connected"}
-        return "VPN — " + ", ".join(f"{name}: {words[conn['vpn']]}" for name, conn in conns.items())
+        return "VPN — " + ", ".join(f"{label_for(name)}: {words[conn['vpn']]}" for name, conn in conns.items())
 
     # The icon next to the clock: gray, orange or green padlock by state, with a menu of the connections.
     # Each platform defines update_tray(), notify(title, text, state) and remove_tray().

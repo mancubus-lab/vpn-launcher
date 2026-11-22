@@ -32,7 +32,8 @@ Every connection has a name and its own folder, log and management port under
 [CmdletBinding(DefaultParameterSetName = "Connect")]
 param(
     # Used as a folder name, hence the restricted character set.
-    [Parameter(Mandatory = $true)][ValidatePattern('^[\w-]+$')][string]$Name,
+    # The connection's internal key (its number, or its old name): used as a folder name.
+    [Parameter(Mandatory = $true)][ValidatePattern('^[\w-]+\z')][string]$Name,
     [Parameter(Mandatory = $true, ParameterSetName = "Connect")][string]$Vault,
     [Parameter(Mandatory = $true, ParameterSetName = "Connect")][string]$Item,
     [Parameter(Mandatory = $true, ParameterSetName = "Connect")][string]$ProfileFile,
