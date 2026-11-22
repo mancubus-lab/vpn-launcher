@@ -201,9 +201,21 @@ function Receive-MgmtLines($Mgmt) {
     }
 }
 
+# One command per write, each after the answer to the previous one. When both lines arrive together while
+# OpenVPN waits for the password, it can process the first one twice and lose the second (seen on the Dev
+# server: "username" logged twice, the password never arrived, the connect hung).
 function Send-MgmtCredentials($Mgmt, [string]$User, [string]$Secret) {
-    $Mgmt.Writer.WriteLine("username `"Auth`" $(ConvertTo-MgmtArgument $User)")
-    $Mgmt.Writer.WriteLine("password `"Auth`" $(ConvertTo-MgmtArgument $Secret)")
+    foreach ($command in "username `"Auth`" $(ConvertTo-MgmtArgument $User)", "password `"Auth`" $(ConvertTo-MgmtArgument $Secret)") {
+        $Mgmt.Writer.WriteLine($command)
+        $deadline = (Get-Date).AddSeconds(10)
+        do {
+            Start-Sleep -Milliseconds 100
+            $answer = Receive-MgmtLines $Mgmt | Where-Object { $_ -match "^(SUCCESS: 'Auth'|ERROR)" } | Select-Object -First 1
+        } until ($answer -or (Get-Date) -gt $deadline)
+        $what = $command.Split(" ")[0]
+        if (-not $answer) { throw "OpenVPN did not confirm the $what within 10 seconds" }
+        if ($answer.StartsWith("ERROR")) { throw "OpenVPN refused the ${what}: $answer" }
+    }
 }
 
 $passwordPrompt = ">PASSWORD:Need 'Auth'"
@@ -253,15 +265,11 @@ if ($Reauth) {
     $mgmt = Open-Mgmt (Get-Date).AddSeconds(10)
     try {
         $deadline = (Get-Date).AddSeconds(30)
-        $sent = $false
         while ((Get-Date) -lt $deadline) {
-            foreach ($line in Receive-MgmtLines $mgmt) {
-                if (-not $sent -and $line.StartsWith($passwordPrompt)) { Send-MgmtCredentials $mgmt $user $secret; $sent = $true }
-                elseif ($sent -and $line -match "^(SUCCESS: 'Auth' password|ERROR)") {
-                    if ($line.StartsWith("ERROR")) { throw "${Name}: OpenVPN refused the credentials: $line" }
-                    "${Name}: the server asked to sign in again; a fresh code was sent."
-                    return
-                }
+            if (Receive-MgmtLines $mgmt | Where-Object { $_.StartsWith($passwordPrompt) }) {
+                Send-MgmtCredentials $mgmt $user $secret
+                "${Name}: the server asked to sign in again; a fresh code was sent."
+                return
             }
             Start-Sleep -Milliseconds 200
         }
@@ -342,10 +350,11 @@ try {
     $asked = 0
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 500
-        foreach ($line in Receive-MgmtLines $mgmt) {
-            if (-not $line.StartsWith($passwordPrompt)) { continue }
+        # One answer per batch: a prompt repeated in the same batch is the same request.
+        if (Receive-MgmtLines $mgmt | Where-Object { $_.StartsWith($passwordPrompt) }) {
             # A retry after a failed first attempt (a TLS timeout, say) asks again: 1Password gives a fresh code.
-            if ($asked++ -and $fromOp) { $user, $secret = Get-OpCredentials $itemId $OtpMode }
+            if ($asked -and $fromOp) { $user, $secret = Get-OpCredentials $itemId $OtpMode }
+            $asked++
             Send-MgmtCredentials $mgmt $user $secret
         }
         $text = if (Test-Path $log) { Get-Content $log -Raw } else { "" }

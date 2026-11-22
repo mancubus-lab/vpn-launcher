@@ -1686,8 +1686,11 @@ def main():
             tell(f"The server asked to sign in again, but {err}: disconnecting. Connect again.")
             link.sendall(b"signal SIGTERM\n")
             return False
-        link.sendall(f'username "Auth" {management_argument(p["username"])}\n'
-                     f'password "Auth" {management_argument(fresh)}\n'.encode())
+        # Two writes: two commands arriving together while OpenVPN waits for the password can lose the second.
+        # shortcut: a fixed pause instead of waiting for the "SUCCESS" answer, which this thread's reader consumes.
+        link.sendall(f'username "Auth" {management_argument(p["username"])}\n'.encode())
+        time.sleep(0.5)
+        link.sendall(f'password "Auth" {management_argument(fresh)}\n'.encode())
         tell("The server asked to sign in again: a fresh code was sent.")
         return False
 
