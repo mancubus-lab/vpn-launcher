@@ -1399,7 +1399,10 @@ def main():
         check_now()
 
     # Reordering by drag and drop: the order is only how the cards are listed, so it is allowed at any time.
-    drag = {"profile": None, "start": 0, "moved": False}
+    # While a card is carried the others stay put: an accent line shows where it will land, and the move
+    # happens on release.
+    drag = {"profile": None, "start": 0, "moved": False, "position": None}
+    drop_line = tk.Frame(frame, bg=BRAND["accent"], height=max(round(3 * display_scale(root)), 2))
 
     def drag_move(pointer_y):
         p = drag["profile"]
@@ -1408,29 +1411,39 @@ def main():
         if not drag["moved"]:
             drag["moved"] = True
             root.configure(cursor="fleur")
-            # The card being carried gets an accent frame, so it is clear which one moves while the others shift.
+            # The card being carried gets an accent frame, so it is clear which one is moving.
             cards[p["key"]][7].configure(highlightbackground=BRAND["accent"], highlightcolor=BRAND["accent"],
                                          highlightthickness=2)
-        # The card goes to the position of the card whose middle the pointer has passed.
+        # The landing place: before the first other card whose middle is below the pointer.
         others = [q for q in profiles if q is not p]
         position = sum(pointer_y > cards[q["key"]][7].winfo_rooty() + cards[q["key"]][7].winfo_height() / 2
                        for q in others)
-        if profiles.index(p) != position:
-            profiles.remove(p)
-            profiles.insert(position, p)
-            for q in profiles:
-                cards[q["key"]][7].pack_forget()
-            for q in profiles:
-                cards[q["key"]][7].pack(fill="x", pady=(0, 10), before=add_button)
+        if position == drag["position"]:
+            return
+        drag["position"] = position
+        drop_line.pack_forget()
+        if position == profiles.index(p):
+            return  # it would land where it is: no line
+        anchor = cards[others[position]["key"]][7] if position < len(others) else add_button
+        drop_line.pack(fill="x", pady=(0, 7), before=anchor)
 
     def drag_end():
+        p, position = drag["profile"], drag["position"]
         if drag["moved"]:
             root.configure(cursor="")
-            if drag["profile"]["key"] in cards:
-                cards[drag["profile"]["key"]][7].configure(highlightbackground=ui["border"],
-                                                           highlightcolor=ui["border"], highlightthickness=1)
-            save_profiles(profiles)
-        drag.update(profile=None, moved=False)
+            drop_line.pack_forget()
+            if p["key"] in cards:
+                cards[p["key"]][7].configure(highlightbackground=ui["border"], highlightcolor=ui["border"],
+                                             highlightthickness=1)
+            if position is not None and position != profiles.index(p):
+                profiles.remove(p)
+                profiles.insert(position, p)
+                for q in profiles:
+                    cards[q["key"]][7].pack_forget()
+                for q in profiles:
+                    cards[q["key"]][7].pack(fill="x", pady=(0, 10), before=add_button)
+                save_profiles(profiles)
+        drag.update(profile=None, moved=False, position=None)
 
     def rename(p):
         """Double click on the name: edit it in place. Enter or a click elsewhere keeps it, Escape gives up.
