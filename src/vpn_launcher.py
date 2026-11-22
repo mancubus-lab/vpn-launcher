@@ -1219,13 +1219,13 @@ def main():
         save_json(PROFILES, items)
 
     def edit(p):
-        """Adds (p is None), changes or deletes a profile, then restarts the program to rebuild the cards."""
+        """Adds (p is None), changes or deletes a profile, then rebuilds the cards in place."""
         if root.grab_current():
             return
         if p and conns[p["name"]]["vpn"] != "off":
             hint.configure(text=f"Disconnect {p['name']} before changing it.")
             return
-        if any(conn["busy"] for conn in conns.values()):  # the restart after saving would orphan that action
+        if any(conn["busy"] for conn in conns.values()):  # the cards are rebuilt after saving: not mid-action
             hint.configure(text="Wait until the running connect or disconnect has finished.")
             return
         answer = edit_profile(root, p, {name.casefold() for name in names if not p or name != p["name"]})
@@ -1249,29 +1249,44 @@ def main():
         old_key = (p or {}).get("otp_key")
         if not WINDOWS and old_key and old_key not in {item.get("otp_key") for item in items}:
             vpn_mac.forget(old_key)
-        restart()
+        rebuild_cards(items)
 
     scale = display_scale(root)
     graph_size = round(170 * scale), round(44 * scale)
 
     # One card per connection: padlock indicator, name, status line, traffic graph and its own buttons.
     cards = {}
-    for p in profiles:
+
+    def build_card(p):
         # The outer frame is the card's border and holds a stripe in the state colour along the left edge.
         shell = tk.Frame(frame, bg=ui["card"], highlightthickness=1, highlightbackground=ui["border"])
-        shell.pack(fill="x", pady=(0, 10))  # drag_move() re-packs the cards with the same options
+        # drag_move() re-packs the cards with the same options; cards added later go above "Add profile".
+        shell.pack(fill="x", pady=(0, 10), **({"before": app["add_button"]} if "add_button" in app else {}))
         stripe = tk.Frame(shell, bg=ui["off"], width=max(round(5 * display_scale(root)), 3))
         stripe.pack(side="left", fill="y")
-        card = tk.Frame(shell, bg=ui["card"], padx=14, pady=12)
+        # A grip on the left edge says the card can be dragged; the whole card drags, the grip shows it.
+        grip = tk.Label(shell, text="⋮⋮", bg=ui["card"], fg=ui["muted"], font=("Segoe UI", 11), cursor="fleur",
+                        padx=4)
+        grip.pack(side="left", fill="y")
+        card = tk.Frame(shell, bg=ui["card"], padx=10, pady=12)
         card.pack(side="left", fill="both", expand=True)
         # Room for the longest status line, so a long uptime is not clipped by the graph next to it.
         card.columnconfigure(1, weight=1, minsize=tkfont.Font(family="Segoe UI", size=10).measure(
             "Connected  ·  255.255.255.255  ·  99 h 59 min"))
         lamp = tk.Label(card, image=pictures["off"], bg=ui["card"])
         lamp.grid(row=0, column=0, rowspan=3, padx=(0, 14))
-        title = tk.Label(card, text=p["name"], bg=ui["card"], fg=ui["text"], font=("Segoe UI Semibold", 13))
-        title.grid(row=0, column=1, sticky="w")
+        # The name with a pencil after it: a click on the pencil or a double click on the name renames.
+        name_row = tk.Frame(card, bg=ui["card"])
+        name_row.grid(row=0, column=1, sticky="w")
+        title = tk.Label(name_row, text=p["name"], bg=ui["card"], fg=ui["text"], font=("Segoe UI Semibold", 13),
+                         cursor="xterm")
+        title.pack(side="left")
         title.bind("<Double-Button-1>", lambda event, p=p: rename(p))
+        pencil = tk.Label(name_row, text="✎", bg=ui["card"], fg=ui["muted"], font=("Segoe UI", 11), cursor="hand2")
+        pencil.pack(side="left", padx=(6, 0))
+        pencil.bind("<Button-1>", lambda event, p=p: rename(p))
+        pencil.bind("<Enter>", lambda event: event.widget.configure(fg=ui["text"]))
+        pencil.bind("<Leave>", lambda event: event.widget.configure(fg=ui["muted"]))
         line = tk.Label(card, text="Checking...", bg=ui["card"], fg=ui["off"], font=("Segoe UI", 10))
         line.grid(row=1, column=1, sticky="w")
         button = ttk.Button(card, text="Connect", width=13, command=lambda p=p: toggle(p))
@@ -1293,13 +1308,33 @@ def main():
         graph.grid(row=0, column=2, rowspan=3, padx=(16, 0))
         cards[p["name"]] = lamp, line, button, flow, graph, edit_button, stripe, shell, title
         # The card is dragged by any of its passive parts; the buttons keep their own clicks.
-        for handle in (card, lamp, title, line, table, graph, stripe, *flow):
+        for handle in (card, grip, lamp, name_row, title, line, table, graph, stripe, *flow):
             handle.bind("<ButtonPress-1>", lambda event, p=p: drag.update(profile=p, start=event.y_root, moved=False))
             handle.bind("<B1-Motion>", lambda event: drag_move(event.y_root))
             handle.bind("<ButtonRelease-1>", lambda event: drag_end())
 
-    add_button = ttk.Button(frame, text="+  Add profile", command=lambda: edit(None))
+    for p in profiles:
+        build_card(p)
+
+    add_button = app["add_button"] = ttk.Button(frame, text="+  Add profile", command=lambda: edit(None))
     add_button.pack(anchor="w", pady=(0, 6))
+
+    def rebuild_cards(items):
+        """Shows a changed profile list in place: no restart, so the window stays where it is."""
+        for parts in cards.values():
+            parts[7].destroy()  # the card's outer frame
+        cards.clear()
+        profiles[:] = items
+        names[:] = [item["name"] for item in items]
+        for name in [name for name in conns if name not in names]:
+            del conns[name]
+        for item in items:
+            # A new or renamed profile starts unknown; an unchanged name keeps what is known about it.
+            conns.setdefault(item["name"], {"vpn": None, "busy": "", "log": "", "traffic": None, "rates": []})
+            build_card(item)
+            update_card(item["name"])
+        hint.configure(text="" if items else "No profiles yet: add one to get started.")
+        check_now()
 
     # Reordering by drag and drop: the order is only how the cards are listed, so it is allowed at any time.
     drag = {"profile": None, "start": 0, "moved": False}
@@ -1330,7 +1365,7 @@ def main():
         drag.update(profile=None, moved=False)
 
     def rename(p):
-        """Double click on the name: edit it in place. Enter keeps the new name, Escape gives up."""
+        """Double click on the name: edit it in place. Enter or a click elsewhere keeps it, Escape gives up."""
         old = p["name"]
         if root.grab_current() or drag["moved"]:
             return
@@ -1339,22 +1374,30 @@ def main():
             return
         title = cards[old][8]
         text = tk.StringVar(value=old)
-        entry = ttk.Entry(title.master, textvariable=text, font=("Segoe UI Semibold", 12), width=24)
+        # Laid over the name and its pencil, in the card's grid cell they share.
+        entry = ttk.Entry(title.master.master, textvariable=text, font=("Segoe UI Semibold", 12), width=24)
         entry.grid(row=0, column=1, sticky="w")
         entry.select_range(0, "end")
         entry.focus_set()
+        hint.configure(text="Enter or a click elsewhere saves the name, Esc cancels. "
+                            "Letters, digits, _ and - only, no spaces.")
 
         def keep(event=None):
+            if not entry.winfo_exists():
+                return  # already closed: Enter closes it, and the focus leaving afterwards calls this again
             new = text.get().strip()
             if new == old:
                 entry.destroy()
+                hint.configure(text="")
                 return
             try:
                 check_profile({**p, "name": new})
                 if new.casefold() in {name.casefold() for name in names if name != old}:
                     raise ValueError(f"{new}: this name is already used")
             except ValueError as error:
-                hint.configure(text=str(error))
+                hint.configure(text=f"Not renamed. {error}")
+                if event is not None and event.type == tk.EventType.FocusOut:
+                    entry.destroy()  # the user went elsewhere: leave the old name, the line says why
                 return
             # The name is the key of everything kept per connection; the buttons read it from p when pressed.
             p["name"] = new
@@ -1366,9 +1409,13 @@ def main():
             hint.configure(text="")
             entry.destroy()
 
+        def cancel(event=None):
+            entry.destroy()
+            hint.configure(text="")
+
         entry.bind("<Return>", keep)
-        entry.bind("<Escape>", lambda event: entry.destroy())
-        entry.bind("<FocusOut>", lambda event: entry.destroy())
+        entry.bind("<Escape>", cancel)
+        entry.bind("<FocusOut>", keep)
 
     def draw_graph(name):
         """Download (green area) and upload (blue line) speed of the last two minutes, scaled to the highest value."""
