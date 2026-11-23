@@ -611,6 +611,23 @@ for bad in ({"name": "  ", "vault": "v", "item": "i", "profile_file": "f"}, {"na
 PASSWORD_PROMPT = ">PASSWORD:Need 'Auth'"
 
 
+def format_password(password, otp, mode):
+    """How the one-time code travels: appended to the password, or as an SCRV1 static-challenge answer.
+
+    The same rules as Format-VpnPassword in the connect script (and vpn_mac.format_password).
+    """
+    if mode == "None":
+        return password
+    if mode == "Scrv1":
+        encode = lambda text: base64.b64encode(text.encode()).decode()  # noqa: E731
+        return f"SCRV1:{encode(password)}:{encode(otp)}"
+    return password + otp
+
+
+assert format_password("p", "1", "Scrv1") == "SCRV1:cA==:MQ=="
+assert format_password("p", "1", "Append") == "p1" and format_password("p", "1", "None") == "p"
+
+
 def management_argument(text):
     """A management command argument: in double quotes, with backslashes and quotes escaped."""
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
@@ -1173,6 +1190,7 @@ def main():
     conns = {name: {"vpn": None, "busy": "", "log": "", "traffic": None, "rates": []} for name in names}
     app = {"overall": None, "update": None}
     links, samples = {}, {}  # per connection: the open management link and the newest (time, in, out)
+    held = {}  # per connected 1Password profile: user, password, code key and OTP mode, in memory only
 
     # Header in the Mancubus Lab colours of the theme: logo, name, a one-line summary, and the About and update buttons.
     header = tk.Frame(root, bg=BRAND["bg"], padx=18, pady=12)
@@ -1279,6 +1297,7 @@ def main():
         else:
             if not confirm(root, f"Disconnect {label_of(p)}?"):
                 return
+            held.pop(p["key"], None)
             link = links.get(p["key"])
             if link:  # free the management interface for the script's graceful stop
                 try:
@@ -1573,6 +1592,8 @@ def main():
             if new != "off" and not conn["busy"] and name not in links:
                 links[name] = None  # reserved, so that the next refresh does not start a second watcher
                 threading.Thread(target=watch_traffic, args=(name, links, samples, answer_password), daemon=True).start()
+            if new == "off":
+                held.pop(name, None)  # the credentials live only as long as the connection
             if new != "on":
                 conn["traffic"], conn["rates"] = None, []
                 for cell in cards[name][3]:
@@ -1637,6 +1658,9 @@ def main():
     def finish(name, result):
         code, text = result
         say(text or f"exit code {code}", label_for(name))
+        p = next((p for p in profiles if p["key"] == name), None)
+        if code == 0 and conns[name]["busy"] == "Connecting..." and p and p.get("source") != "file" and WINDOWS:
+            keep_credentials(p)
         conns[name]["busy"] = ""
         update_card(name)
         if code == 0:
@@ -1668,6 +1692,19 @@ def main():
 
         if not p:
             return False
+        kept = held.get(name)
+        if p.get("source") != "file" and kept:
+            try:
+                user = kept["user"]
+                fresh = format_password(kept["password"], totp(kept["otp_key"]) if kept["mode"] != "None" else "",
+                                        kept["mode"])
+            except Exception as err:  # a key 1Password stores in a form totp() does not read
+                held.pop(name, None)
+                tell(f"The credentials kept in memory cannot make a code ({type(err).__name__}): asking 1Password.")
+            else:
+                send_credentials(link, user, fresh)
+                tell("The server asked to sign in again: a fresh code was made from the credentials in memory.")
+                return False
         if p.get("source") != "file":
             tell("The server asked to sign in again: getting a fresh code from 1Password...")
             # shutdown, not close: the reader's makefile keeps the socket open until it is closed itself.
@@ -1676,6 +1713,10 @@ def main():
                                     "-OtpField", p.get("otp_field") or "one-time password",
                                     "-OtpMode", p.get("otp_mode") or "Auto")
             tell(text or f"exit code {code}")
+            if code != 0:
+                # Retrying every few minutes only kept OpenVPN hanging and finally crashed it: stop it cleanly.
+                tell("No fresh code from 1Password: disconnecting. Connect again when 1Password is unlocked.")
+                tell(run_script("-Name", name, "-Disconnect")[1])
             return True
         try:
             if not (p.get("otp_key") and p.get("username")):
@@ -1686,13 +1727,37 @@ def main():
             tell(f"The server asked to sign in again, but {err}: disconnecting. Connect again.")
             link.sendall(b"signal SIGTERM\n")
             return False
-        # Two writes: two commands arriving together while OpenVPN waits for the password can lose the second.
-        # shortcut: a fixed pause instead of waiting for the "SUCCESS" answer, which this thread's reader consumes.
-        link.sendall(f'username "Auth" {management_argument(p["username"])}\n'.encode())
-        time.sleep(0.5)
-        link.sendall(f'password "Auth" {management_argument(fresh)}\n'.encode())
+        send_credentials(link, p["username"], fresh)
         tell("The server asked to sign in again: a fresh code was sent.")
         return False
+
+    def send_credentials(link, user, password):
+        # Two writes: two commands arriving together while OpenVPN waits for the password can lose the second.
+        # shortcut: a fixed pause instead of waiting for the "SUCCESS" answer, which this thread's reader consumes.
+        link.sendall(f'username "Auth" {management_argument(user)}\n'.encode())
+        time.sleep(0.5)
+        link.sendall(f'password "Auth" {management_argument(password)}\n'.encode())
+
+    def keep_credentials(p):
+        """After a 1Password connect: fetch the credentials once more and keep them in memory (never on disk)."""
+        key = p["key"]
+
+        def kept(result):
+            code, text = result
+            try:
+                if code != 0:
+                    raise ValueError
+                found = json.loads(text.strip().splitlines()[-1])
+                if not all(isinstance(found.get(field), str) for field in ("user", "password", "otp_key", "mode")):
+                    raise ValueError
+                held[key] = found
+            except (ValueError, IndexError, AttributeError):
+                held.pop(key, None)
+                # The output is not shown: it may hold a secret.
+                say("Could not keep the credentials in memory: a renegotiation will ask 1Password.", label_for(key))
+        background(lambda: run_script("-Name", key, "-Secrets", "-Vault", p["vault"], "-Item", p["item"],
+                                      "-OtpField", p.get("otp_field") or "one-time password",
+                                      "-OtpMode", p.get("otp_mode") or "Auto"), kept)
 
     def look_for_update(asked=False):
         """Asks GitHub for a newer release; asked=True when the user pressed the button and wants an answer."""

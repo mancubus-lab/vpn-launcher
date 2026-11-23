@@ -36,15 +36,19 @@ param(
     # Used as a folder name, hence the restricted character set.
     # The connection's internal key (its number, or its old name): used as a folder name.
     [Parameter(Mandatory = $true)][ValidatePattern('^[\w-]+\z')][string]$Name,
-    [Parameter(Mandatory = $true, ParameterSetName = "Connect")][Parameter(Mandatory = $true, ParameterSetName = "Reauth")][string]$Vault,
-    [Parameter(Mandatory = $true, ParameterSetName = "Connect")][Parameter(Mandatory = $true, ParameterSetName = "Reauth")][string]$Item,
+    [Parameter(Mandatory = $true, ParameterSetName = "Connect")][Parameter(Mandatory = $true, ParameterSetName = "Reauth")][Parameter(Mandatory = $true, ParameterSetName = "Secrets")][string]$Vault,
+    [Parameter(Mandatory = $true, ParameterSetName = "Connect")][Parameter(Mandatory = $true, ParameterSetName = "Reauth")][Parameter(Mandatory = $true, ParameterSetName = "Secrets")][string]$Item,
     [Parameter(Mandatory = $true, ParameterSetName = "Connect")][string]$ProfileFile,
     [Parameter(ParameterSetName = "Connect")][string]$ProfileItem = $Item,
-    [Parameter(ParameterSetName = "Connect")][Parameter(ParameterSetName = "Reauth")][string]$OtpField = "one-time password",
+    [Parameter(ParameterSetName = "Connect")][Parameter(ParameterSetName = "Reauth")][Parameter(ParameterSetName = "Secrets")][string]$OtpField = "one-time password",
     # Auto: Scrv1 when the profile declares static-challenge, otherwise Append (password + code).
-    [Parameter(ParameterSetName = "Connect")][Parameter(ParameterSetName = "Reauth")][ValidateSet("Auto", "Append", "Scrv1", "None")][string]$OtpMode = "Auto",
+    [Parameter(ParameterSetName = "Connect")][Parameter(ParameterSetName = "Reauth")][Parameter(ParameterSetName = "Secrets")][ValidateSet("Auto", "Append", "Scrv1", "None")][string]$OtpMode = "Auto",
     # A running 1Password connection was asked for its credentials again: answer with a fresh code.
     [Parameter(Mandatory = $true, ParameterSetName = "Reauth")][switch]$Reauth,
+    # For the launcher only, right after a connect: one JSON line with the user name, the password, the
+    # one-time code key and the OTP mode. The launcher keeps them in memory to answer later sign-in requests
+    # itself, so that a renegotiation at night does not wait for a 1Password approval nobody gives.
+    [Parameter(Mandatory = $true, ParameterSetName = "Secrets")][switch]$Secrets,
     # Without 1Password: a profile file on disk; the user name and the password are read from stdin (two lines).
     [Parameter(Mandatory = $true, ParameterSetName = "File")][string]$ProfilePath,
     [Parameter(ParameterSetName = "Connect")][Parameter(ParameterSetName = "File")][int]$TimeoutSec = 90,
@@ -255,11 +259,33 @@ if ($Status -or $Disconnect) {
     return
 }
 
-if ($Reauth) {
+if ($Reauth -or $Secrets) {
     if (-not $running) { throw "${Name}: not connected." }
     $script:op = Find-OpCli
     $mode = if ($OtpMode -ne "Auto") { $OtpMode } else { "$(Get-Content $modeFile -TotalCount 1 -ErrorAction SilentlyContinue)" }
     if ($mode -notin "Append", "Scrv1", "None") { $mode = "Append" }
+}
+
+if ($Secrets) {
+    $itemId = Resolve-OpItemId $Item
+    $key = ""
+    if ($mode -ne "None") {
+        # Without ?attribute=otp the field reads as its otpauth:// URI, which holds the base32 key.
+        $uri = "$(Read-OpSecret "op://$Vault/$itemId/$OtpField")"
+        $found = [regex]::Match($uri, '[?&]secret=([^&]+)')
+        $key = if ($found.Success) { [uri]::UnescapeDataString($found.Groups[1].Value) } elseif ($uri -notmatch '://') { $uri } else { "" }
+        $uri = $null
+    }
+    [pscustomobject]@{
+        user     = "$(Read-OpSecret "op://$Vault/$itemId/username")"
+        password = "$(Read-OpSecret "op://$Vault/$itemId/password")"
+        otp_key  = $key
+        mode     = $mode
+    } | ConvertTo-Json -Compress
+    return
+}
+
+if ($Reauth) {
     # Credentials first: a 1Password approval may take a while, the management interface is held only briefly.
     $user, $secret = Get-OpCredentials (Resolve-OpItemId $Item) $mode
     $mgmt = Open-Mgmt (Get-Date).AddSeconds(10)
